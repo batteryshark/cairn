@@ -1,3 +1,5 @@
+"""Reads Codex, Claude, and OpenCode histories into the vault."""
+
 from __future__ import annotations
 
 import hashlib
@@ -9,6 +11,7 @@ import shutil
 import socket
 import sqlite3
 import subprocess
+import time
 import zlib
 from contextlib import closing
 from dataclasses import dataclass, field
@@ -271,11 +274,8 @@ class VaultSyncer:
     def turn_id(run_id: str, vendor_turn_id: str) -> str:
         return f"{run_id}:turn:{vendor_turn_id}"
 
-    def existing_run_id(self, provider: str, vendor_id: str, stream_key: str, *, parent_vendor_id: str | None = None) -> str | None:
-        if parent_vendor_id and stream_key.startswith("agent:"):
-            candidate = self.run_id(provider, vendor_id, stream_key)
-        else:
-            candidate = self.run_id(provider, vendor_id, stream_key)
+    def existing_run_id(self, provider: str, vendor_id: str, stream_key: str) -> str | None:
+        candidate = self.run_id(provider, vendor_id, stream_key)
         return candidate if self.conn.execute("SELECT 1 FROM runs WHERE id=?", (candidate,)).fetchone() else None
 
     def ensure_run(
@@ -1533,7 +1533,6 @@ def _time_value(value: Any) -> str | None:
         return None
     if isinstance(value, (int, float)):
         seconds = float(value) / 1000 if value > 10_000_000_000 else float(value)
-        import time
         return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(seconds))
     return str(value)
 

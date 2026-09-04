@@ -4,6 +4,6 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
-from harness_vault.cli import main
+from cairn.cli import main
 
 raise SystemExit(main())

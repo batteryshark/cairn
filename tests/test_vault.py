@@ -8,9 +8,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from harness_vault.db import open_database
-from harness_vault.ingest import SyncOptions, VaultSyncer, normalize_git_remote
-from harness_vault.reporting import export_native, export_unified, status_data, verify
+from cairn.db import open_database
+from cairn.ingest import SyncOptions, VaultSyncer, normalize_git_remote
+from cairn.reporting import export_native, export_unified, status_data, verify
 
 
 PARENT = "019dc002-6a31-7893-834c-52264540040d"

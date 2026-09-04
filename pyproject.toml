@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "harness-vault"
+name = "cairn"
 version = "0.1.0"
 description = "Lossless local archive for Claude Code, Codex, and OpenCode runs"
 readme = "README.md"
@@ -13,7 +13,7 @@ authors = [{name = "BatteryShark"}]
 dependencies = []
 
 [project.scripts]
-harness-vault = "harness_vault.cli:main"
+cairn = "cairn.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

@@ -1,3 +1,5 @@
+"""SQLite schema, migrations, and connection handling for a cairn vault."""
+
 from __future__ import annotations
 
 import hashlib
@@ -387,7 +389,7 @@ def open_database(path: Path, *, writable: bool = True) -> sqlite3.Connection:
                 "SELECT value FROM vault_meta WHERE key = 'schema_version'"
             ).fetchone()
         except sqlite3.Error as exc:
-            raise RuntimeError(f"not a harness-vault database: {path}") from exc
+            raise RuntimeError(f"not a cairn database: {path}") from exc
         if not version or int(version[0]) != SCHEMA_VERSION:
             raise RuntimeError(f"unsupported or missing vault schema in {path}")
     conn.row_factory = sqlite3.Row

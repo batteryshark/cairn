@@ -1,3 +1,5 @@
+"""Command line surface: sync, status, verify, export."""
+
 from __future__ import annotations
 
 import argparse
@@ -14,7 +16,7 @@ from .reporting import export_native, export_unified, print_status, status_data,
 
 
 def parser() -> argparse.ArgumentParser:
-    result = argparse.ArgumentParser(prog="harness-vault", description="Archive Claude Code, Codex, and OpenCode runs in one SQLite vault")
+    result = argparse.ArgumentParser(prog="cairn", description="Archive Claude Code, Codex, and OpenCode runs in one SQLite vault")
     sub = result.add_subparsers(dest="command", required=True)
 
     sync = sub.add_parser("sync", help="incrementally ingest local or copied histories")
@@ -45,7 +47,7 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     if sys.version_info < (3, 11):
-        print("harness-vault requires Python 3.11 or newer", file=sys.stderr)
+        print("cairn requires Python 3.11 or newer", file=sys.stderr)
         return 1
     os.umask(0o077)
     args = parser().parse_args(argv)
@@ -81,7 +83,7 @@ def main(argv: list[str] | None = None) -> int:
                     export_native(conn, Path(args.output))
             return 0
     except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
-        print(f"harness-vault: {exc}", file=sys.stderr)
+        print(f"cairn: {exc}", file=sys.stderr)
         return 1
     return 1
 

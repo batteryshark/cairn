@@ -1,3 +1,5 @@
+"""Status, integrity verification, and export of a vault."""
+
 from __future__ import annotations
 
 import base64
