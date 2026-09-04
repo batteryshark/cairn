@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "harness-vault"
+version = "0.1.0"
+description = "Lossless local archive for Claude Code, Codex, and OpenCode runs"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "BatteryShark"}]
+dependencies = []
+
+[project.scripts]
+harness-vault = "harness_vault.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
