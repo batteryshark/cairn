@@ -3,8 +3,9 @@
 # cairn
 
 Keep one archive of every local agent run. `cairn` reads the histories that
-Codex CLI, Claude Code, Claude Desktop, and OpenCode leave on disk and writes
-them into a single SQLite file you own.
+Codex, Claude Code, and OpenCode leave on disk and writes them into a single
+SQLite file you own. That covers every Codex and Claude surface: the desktop
+apps, the CLIs, the IDE extensions, and headless `codex exec`.
 
 It runs on Python 3.11 or newer and uses only the standard library.
 
@@ -57,10 +58,16 @@ With no flags, `sync` uses whichever of these directories exist:
 
 | Source | Path |
 | --- | --- |
-| Codex CLI | `~/.codex` |
+| Codex, every surface | `~/.codex` |
 | Claude Code | `~/.claude` |
 | Claude Desktop | `~/Library/Application Support/Claude/claude-code-sessions` |
 | OpenCode | `$XDG_DATA_HOME/opencode` or `~/.local/share/opencode` |
+
+Codex Desktop, the Codex CLI, the VS Code extension, and `codex exec` all write
+to the same `~/.codex` root, so one path covers them. Each run keeps the
+originator that produced it in `runs.surface`, for example `Codex Desktop`,
+`codex_vscode`, or `codex_exec`. The Codex app's own Electron caches under
+`~/Library/Application Support` hold no run content and are not read.
 
 To import a history copied from another machine, name that machine:
 
@@ -119,8 +126,9 @@ SELECT * FROM daily_usage ORDER BY day, provider;
 
 ## Coverage notes
 
-Codex ingestion covers active and archived rollouts, the session index,
-thread and turn state, spawn edges, plans, goals, and thread-linked artifacts.
+Codex ingestion covers active and archived rollouts from every surface, the
+session index, thread and turn state, spawn edges, subagent threads, plans,
+goals, and thread-linked artifacts.
 
 Claude ingestion covers project transcripts, nested subagent transcripts and
 metadata, Desktop code-session links, plans, task and team records,
