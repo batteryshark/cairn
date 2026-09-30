@@ -84,6 +84,14 @@ Explicit paths are pinned. A missing path is an error, and any provider you do
 not name is disabled for that run. That keeps an imported archive from being
 silently attributed to the local machine.
 
+For a closed Mac backup mounted through an APFS driver on Windows, add
+`--snapshot-source-sqlite` if source databases report `database is locked`.
+This reads temporary local copies of the source databases and their WAL files,
+leaving the original backup untouched. Copied SHM files are excluded so SQLite
+can rebuild them. Use this option only for backups that are no longer being
+written. Keep the destination vault on a local filesystem that supports SQLite
+locking, and allow temporary space for the largest source database and its WAL.
+
 ## Size limits
 
 The first sync checks free disk space. Defaults are 64 MiB per copied artifact
@@ -128,11 +136,19 @@ SELECT * FROM daily_usage ORDER BY day, provider;
 
 Codex ingestion covers active and archived rollouts from every surface, the
 session index, thread and turn state, spawn edges, subagent threads, plans,
-goals, and thread-linked artifacts.
+goals, and thread-linked artifacts. Generated memory files under `.codex/memories`
+and consistent standalone snapshots of `memories_*.sqlite` are versioned artifacts.
+SQLite memory snapshots include committed WAL data and all native tables.
 
 Claude ingestion covers project transcripts, nested subagent transcripts and
 metadata, Desktop code-session links, plans, task and team records,
 externalized tool results, and referenced files in the uploads directory.
+All files under `.claude/projects/<project>/memory` (or `memories`) are preserved
+byte-for-byte as project memory artifacts, including nested files. These are
+shared project context and are not attributed to a single transcript. Changed
+memory contents create new artifact versions; native exports recover every
+stored version under its original relative path. The artifact size cap applies
+to memory files and database snapshots too.
 
 OpenCode ingestion covers the SQLite session, message, and part projections,
 parent sessions, text and reasoning parts, tool calls and results, per-response
@@ -142,8 +158,8 @@ purpose: it is a replay journal of repeated snapshots of those same
 projections, 16.8 GiB against 1.65 GiB on the store measured here, and holds no
 run content the projections lack.
 
-Ordinary consumer Claude chats, auth and configuration, global memory, caches,
-debug logs, shell snapshots, and queues are excluded.
+Ordinary consumer Claude chats, auth and configuration, skills, rules, hooks,
+automations, caches, debug logs, shell snapshots, and queues are excluded.
 
 Token accounting is deliberate. Claude response usage counts once per request
 even when the same usage object repeats on thinking, tool, and text blocks.
