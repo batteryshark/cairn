@@ -29,6 +29,8 @@ def parser() -> argparse.ArgumentParser:
     sync.add_argument("--artifact-max-bytes", type=_positive_int, default=DEFAULT_ARTIFACT_MAX)
     sync.add_argument("--max-record-bytes", type=_positive_int, default=DEFAULT_RECORD_MAX)
     sync.add_argument("--ignore-space-check", action="store_true")
+    sync.add_argument("--snapshot-source-sqlite", action="store_true",
+                      help="read closed backup databases and their WAL from local temporary copies (use for APFS backups on Windows)")
 
     status = sub.add_parser("status", help="show archive and usage totals")
     status.add_argument("vault", type=Path)
@@ -110,6 +112,7 @@ def _sync(args: argparse.Namespace) -> int:
         codex_home=codex, claude_home=claude, claude_app_support=app, opencode_data=opencode,
         artifact_max_bytes=args.artifact_max_bytes, max_record_bytes=args.max_record_bytes,
         ignore_space_check=args.ignore_space_check,
+        snapshot_source_sqlite=args.snapshot_source_sqlite,
     )
     with closing(open_database(options.db_path)) as conn:
         stats = VaultSyncer(conn, options).sync()

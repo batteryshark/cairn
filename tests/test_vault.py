@@ -6,6 +6,8 @@ import sqlite3
 import stat
 import tempfile
 import unittest
+import os
+from unittest.mock import patch
 from pathlib import Path
 
 from cairn.db import open_database
@@ -50,6 +52,7 @@ class VaultTest(unittest.TestCase):
         self._make_opencode()
 
     def tearDown(self) -> None:
+        self.doCleanups()
         self.temp.cleanup()
 
     def options(self, **changes: object) -> SyncOptions:
@@ -221,6 +224,194 @@ class VaultTest(unittest.TestCase):
         self.assertEqual(data["unresolved_children"], 0)
         conn.close()
 
+    def test_unreadable_task_directory_preserves_sibling_artifacts(self) -> None:
+        empty = self.claude / "tasks/session-empty"
+        empty.mkdir(parents=True)
+        (empty / "unreadable.json").write_bytes(b'{}')
+        good = self.claude / "tasks/session-good/1.json"
+        good.parent.mkdir()
+        good.write_bytes(b'{"subject":"keep me"}')
+        scandir = os.scandir
+
+        def scan(path):
+            if Path(path) == empty:
+                error = FileNotFoundError(2, "The system cannot find the file specified", str(path))
+                error.winerror = 2
+                raise error
+            return scandir(path)
+
+        with patch("cairn.ingest.os.scandir", side_effect=scan):
+            conn, stats = self.sync()
+        self.addCleanup(conn.close)
+        self.assertGreater(stats.records_added, 0)
+        self.assertTrue(conn.execute("SELECT 1 FROM artifacts WHERE relative_path LIKE '%session-good%'").fetchone())
+        warnings = conn.execute("SELECT message FROM ingest_errors WHERE code='discovery_unreadable'").fetchall()
+        self.assertEqual(len(warnings), 1)
+        self.assertIn(str(empty), warnings[0][0])
+        self.assertEqual(conn.execute("SELECT status FROM sync_runs ORDER BY id DESC LIMIT 1").fetchone()[0], "warnings")
+        with patch("cairn.ingest.os.scandir", side_effect=scan):
+            repeated = VaultSyncer(conn, self.options()).sync()
+        self.assertGreater(repeated.warnings, 0)
+        VaultSyncer(conn, self.options()).sync()
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM ingest_errors WHERE code='discovery_unreadable'").fetchone()[0], 1)
+
+    def test_failed_recursive_scan_keeps_checkpoints_and_discovers_siblings(self) -> None:
+        conn, _ = self.sync()
+        self.addCleanup(conn.close)
+        before = conn.execute("SELECT checkpoint_offset FROM source_files WHERE relative_path LIKE ?", ("%" + self.parent_rollout.name,)).fetchone()[0]
+        good = self.codex / "sessions/other/unknown.jsonl"
+        write_lines(good, [{"type": "fixture"}])
+        scandir = os.scandir
+
+        def scan(path):
+            if Path(path) == self.parent_rollout.parent:
+                raise PermissionError(13, "Access denied", str(path))
+            return scandir(path)
+
+        with patch("cairn.ingest.os.scandir", side_effect=scan):
+            stats = VaultSyncer(conn, self.options()).sync()
+        self.assertGreater(stats.warnings, 0)
+        row = conn.execute("SELECT checkpoint_offset,state FROM source_files WHERE relative_path LIKE ?", ("%" + self.parent_rollout.name,)).fetchone()
+        self.assertEqual(tuple(row), (before, "present"))
+        self.assertTrue(conn.execute("SELECT 1 FROM source_files WHERE relative_path LIKE '%unknown.jsonl'").fetchone())
+        self.assertEqual(conn.execute("PRAGMA quick_check").fetchone()[0], "ok")
+
+    def test_empty_optional_directories_are_accepted(self) -> None:
+        for relative in ("tasks/session-empty", "teams/empty", "plans", "projects/empty/memories"):
+            (self.claude / relative).mkdir(parents=True, exist_ok=True)
+        scandir = os.scandir
+
+        def scan(path):
+            if Path(path).is_dir() and not os.listdir(path):
+                error = FileNotFoundError(2, "The system cannot find the file specified", str(path))
+                error.winerror = 2
+                raise error
+            return scandir(path)
+
+        with patch("cairn.ingest.os.scandir", side_effect=scan):
+            conn, stats = self.sync()
+        self.addCleanup(conn.close)
+        self.assertGreater(stats.records_added, 0)
+        self.assertFalse(conn.execute("SELECT 1 FROM ingest_errors WHERE code='discovery_unreadable'").fetchone())
+
+    def test_sqlite_snapshot_preserves_wal_and_ignores_copied_shm(self) -> None:
+        live = self.root / "live.sqlite"
+        writer = sqlite3.connect(live)
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute("CREATE TABLE fixture(value TEXT)")
+        writer.execute("INSERT INTO fixture VALUES('only in WAL')")
+        writer.commit()
+        source = self.root / "closed-backup.sqlite"
+        source.write_bytes(live.read_bytes())
+        wal = Path(f"{source}-wal")
+        wal.write_bytes(Path(f"{live}-wal").read_bytes())
+        writer.close()
+        shm = Path(f"{source}-shm")
+        shm.write_bytes(b"bad")
+        original = (source.read_bytes(), wal.read_bytes(), shm.read_bytes())
+        conn = open_database(self.vault)
+        self.addCleanup(conn.close)
+        syncer = VaultSyncer(conn, self.options(snapshot_source_sqlite=True))
+        with syncer._readonly_sqlite(source) as snapshot:
+            self.assertEqual(snapshot.execute("SELECT value FROM fixture").fetchone()[0], "only in WAL")
+            copied = Path(snapshot.execute("PRAGMA database_list").fetchone()[2])
+            self.assertNotEqual(copied, source)
+            self.assertTrue(copied.exists())
+        self.assertFalse(copied.parent.exists())
+        self.assertEqual((source.read_bytes(), wal.read_bytes(), shm.read_bytes()), original)
+
+    def test_project_memories_are_versioned_exportable_context(self) -> None:
+        project = self.claude / "projects/fixture-project"
+        expected = {
+            project / "memory/MEMORY.md": b"Shared project context\n",
+            project / "memory/nested/notes.jsonl": b'{"memory":"keep raw"}\n',
+            project / "memories/design.txt": b"Design decision\n",
+            self.codex / "memories/memory_summary.md": b"Codex project summary\n",
+        }
+        excluded = {
+            self.claude / "skills/custom/SKILL.md",
+            self.claude / "settings.json",
+            self.codex / "rules/custom.rules",
+            self.codex / "hooks.json",
+            self.codex / "automations/example/automation.toml",
+        }
+        for path, data in expected.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        for path in excluded:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"not memory")
+        conn = open_database(self.vault)
+        self.addCleanup(conn.close)
+        options = self.options(artifact_max_bytes=1024 * 1024)
+        VaultSyncer(conn, options).sync()
+        rows = conn.execute("SELECT a.*,s.root_path,b.data FROM artifacts a JOIN source_instances s ON s.id=a.source_instance_id JOIN blobs b ON b.sha256=a.blob_sha256 WHERE a.kind IN ('project_memory','memory_file')").fetchall()
+        self.assertEqual(len(rows), len(expected))
+        for row in rows:
+            source = Path(row["root_path"]) / row["relative_path"]
+            self.assertEqual(row["data"], expected[source])
+            self.assertIsNone(row["run_id"])
+            self.assertIsNone(row["turn_id"])
+        self.assertFalse(conn.execute("SELECT 1 FROM source_files WHERE relative_path LIKE '%notes.jsonl'").fetchone())
+        all_paths = {Path(row["root_path"]) / row["relative_path"] for row in conn.execute("SELECT a.relative_path,s.root_path FROM artifacts a JOIN source_instances s ON s.id=a.source_instance_id")}
+        self.assertFalse(all_paths & excluded)
+        VaultSyncer(conn, options).sync()
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM artifacts WHERE kind IN ('project_memory','memory_file')").fetchone()[0], len(expected))
+        memory = project / "memory/MEMORY.md"
+        memory.write_bytes(b"Updated context\n")
+        VaultSyncer(conn, options).sync()
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM artifacts WHERE kind='project_memory'").fetchone()[0], 4)
+        output = self.root / "memory-export"
+        export_native(conn, output)
+        recovered = {p.read_bytes() for p in output.rglob("MEMORY.md")}
+        self.assertEqual(recovered, {b"Shared project context\n", b"Updated context\n"})
+        self.assertEqual(verify(conn, self.vault)[0], [])
+
+    def test_codex_memory_database_snapshot_contains_wal_and_all_tables(self) -> None:
+        live = self.root / "live-memories.sqlite"
+        writer = sqlite3.connect(live)
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute("CREATE TABLE stage1_outputs(thread_id TEXT PRIMARY KEY, raw_memory TEXT)")
+        writer.execute("INSERT INTO stage1_outputs VALUES('thread-1','Memory in WAL')")
+        writer.execute("CREATE TABLE future_memory_schema(content TEXT)")
+        writer.execute("INSERT INTO future_memory_schema VALUES('Future context')")
+        writer.commit()
+        source = self.codex / "memories_1.sqlite"
+        source.write_bytes(live.read_bytes())
+        wal = Path(f"{source}-wal")
+        wal.write_bytes(Path(f"{live}-wal").read_bytes())
+        writer.close()
+        shm = Path(f"{source}-shm")
+        shm.write_bytes(b"bad")
+        original = (source.read_bytes(), wal.read_bytes(), shm.read_bytes())
+        conn = open_database(self.vault)
+        self.addCleanup(conn.close)
+        options = self.options(snapshot_source_sqlite=True, artifact_max_bytes=1024 * 1024)
+        VaultSyncer(conn, options).sync()
+        row = conn.execute("SELECT a.relative_path,a.run_id,b.data FROM artifacts a JOIN blobs b ON b.sha256=a.blob_sha256 WHERE a.kind='memory_database'").fetchone()
+        self.assertEqual(row["relative_path"], source.name)
+        self.assertIsNone(row["run_id"])
+        recovered = self.root / "recovered-memory.sqlite"
+        recovered.write_bytes(row["data"])
+        restored = sqlite3.connect(recovered.as_uri() + "?mode=ro", uri=True)
+        try:
+            self.assertEqual(restored.execute("SELECT raw_memory FROM stage1_outputs").fetchone()[0], "Memory in WAL")
+            self.assertEqual(restored.execute("SELECT content FROM future_memory_schema").fetchone()[0], "Future context")
+            self.assertEqual(restored.execute("PRAGMA journal_mode").fetchone()[0], "delete")
+            self.assertEqual(restored.execute("PRAGMA quick_check").fetchone()[0], "ok")
+        finally:
+            restored.close()
+        VaultSyncer(conn, options).sync()
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM artifacts WHERE kind='memory_database'").fetchone()[0], 1)
+        self.assertEqual((source.read_bytes(), wal.read_bytes(), shm.read_bytes()), original)
+        output = self.root / "memory-db-export"
+        export_native(conn, output)
+        exported = list(output.rglob("memories_1.sqlite"))
+        self.assertEqual(len(exported), 1)
+        self.assertEqual(exported[0].read_bytes(), row["data"])
+
     def test_incremental_partial_move_and_idempotence(self) -> None:
         conn, _ = self.sync()
         raw_before = conn.execute("SELECT COUNT(*) FROM raw_records").fetchone()[0]
@@ -280,7 +471,8 @@ class VaultTest(unittest.TestCase):
         errors, warnings = verify(conn, self.vault)
         self.assertEqual(errors, [])
         self.assertEqual(warnings, [])
-        self.assertEqual(stat.S_IMODE(self.vault.stat().st_mode), 0o600)
+        if os.name != "nt":
+            self.assertEqual(stat.S_IMODE(self.vault.stat().st_mode), 0o600)
         conn.close()
 
     def test_malformed_and_oversized_records_are_preserved_or_deferred(self) -> None:

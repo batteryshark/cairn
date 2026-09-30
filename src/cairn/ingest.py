@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import fnmatch
 import json
 import mimetypes
 import os
@@ -12,8 +13,9 @@ import socket
 import sqlite3
 import subprocess
 import time
+import tempfile
 import zlib
-from contextlib import closing
+from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
@@ -38,6 +40,7 @@ class SyncOptions:
     artifact_max_bytes: int = DEFAULT_ARTIFACT_MAX
     max_record_bytes: int = DEFAULT_RECORD_MAX
     ignore_space_check: bool = False
+    snapshot_source_sqlite: bool = False
 
 
 @dataclass
@@ -78,6 +81,52 @@ class VaultSyncer:
         self.project_cache: dict[tuple[str, str | None], str | None] = {}
         self.plan_links: dict[str, str] = {}
         self.referenced_uploads: set[Path] = set()
+        self.discovery_errors: set[Path] = set()
+
+    def _discover_paths(self, root: Path, pattern: str, *, recursive: bool = False) -> Iterable[Path]:
+        """Scan each directory independently so a broken entry cannot hide siblings.
+
+        Some Windows filesystem drivers report an empty directory as WinError 2.
+        Confirm emptiness with listdir; retain warnings for inaccessible data.
+        Never follow directory symlinks while recursively discovering histories.
+        """
+        parts = pattern.split("/")
+        pending = [(root, 0)]
+        while pending:
+            directory, depth = pending.pop()
+            try:
+                with os.scandir(directory) as scan:
+                    entries = sorted(scan, key=lambda entry: entry.name)
+            except OSError as exc:
+                if getattr(exc, "winerror", None) == 2:
+                    try:
+                        if directory.is_dir() and not os.listdir(directory):
+                            continue
+                    except OSError:
+                        pass
+                self._discovery_warning(directory, exc)
+                continue
+            for entry in entries:
+                path = directory / entry.name
+                matched = fnmatch.fnmatch(entry.name, parts[depth])
+                if matched and depth == len(parts) - 1:
+                    yield path
+                if recursive or (matched and depth < len(parts) - 1):
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            pending.append((path, depth if recursive else depth + 1))
+                    except OSError as exc:
+                        self._discovery_warning(path, exc)
+
+    def _discovery_warning(self, path: Path, exc: OSError) -> None:
+        if path not in self.discovery_errors:
+            self.discovery_errors.add(path)
+            previous = self.stats.warnings
+            self.warn(None, "discovery_unreadable", f"{path}: {exc}")
+            # Persistent warnings are deduplicated, but every incomplete sync
+            # must still report warnings and return the warning exit status.
+            if self.stats.warnings == previous:
+                self.stats.warnings += 1
 
     def sync(self) -> SyncStats:
         started = utc_now()
@@ -141,7 +190,7 @@ class VaultSyncer:
             for base, kind in ((codex / "sessions", "rollout"), (codex / "archived_sessions", "rollout")):
                 if not base.is_dir():
                     continue
-                for path in sorted(base.rglob("*.jsonl")):
+                for path in sorted(self._discover_paths(base, "*.jsonl", recursive=True)):
                     match = CODEX_RUN_RE.search(path.name)
                     if not match:
                         yield JsonlSource("codex", codex, path, "unknown_jsonl", f"file:{path.relative_to(codex)}", None, "unknown")
@@ -155,8 +204,11 @@ class VaultSyncer:
         claude = self.options.claude_home
         projects = claude / "projects" if claude else None
         if projects and projects.is_dir():
-            for path in sorted(projects.rglob("*.jsonl")):
+            for path in sorted(self._discover_paths(projects, "*.jsonl", recursive=True)):
                 parts = path.relative_to(projects).parts
+                if len(parts) >= 3 and parts[1] in {"memory", "memories"}:
+                    # Memory files are project context, not session transcripts.
+                    continue
                 if "subagents" in parts and path.name.startswith("agent-"):
                     parent_id = path.parent.parent.name
                     agent_id = path.stem.removeprefix("agent-")
@@ -171,9 +223,14 @@ class VaultSyncer:
     def discover_artifacts(self) -> Iterable[tuple[str, Path, Path, str, str | None, str | None]]:
         codex = self.options.codex_home
         if codex and codex.is_dir():
+            memories = codex / "memories"
+            if memories.is_dir():
+                for path in sorted(self._discover_paths(memories, "*", recursive=True)):
+                    if (path.is_file() or path.is_symlink()) and path.name != ".DS_Store":
+                        yield "codex", codex, path, "memory_file", None, None
             plans = codex / "plans"
             if plans.is_dir():
-                for path in sorted(plans.glob("*/*/PLAN.md")):
+                for path in sorted(self._discover_paths(plans, "*/*/PLAN.md")):
                     relative = path.relative_to(plans)
                     vendor_id, vendor_turn = relative.parts[:2]
                     run_id = self.run_id("codex", vendor_id, "main")
@@ -183,7 +240,7 @@ class VaultSyncer:
         opencode = self.options.opencode_data
         tool_output = opencode / "tool-output" if opencode else None
         if tool_output and tool_output.is_dir():
-            for path in sorted(p for p in tool_output.iterdir() if p.is_file() or p.is_symlink()):
+            for path in sorted(p for p in self._discover_paths(tool_output, "*") if p.is_file() or p.is_symlink()):
                 linked = self.conn.execute(
                     """SELECT run_id,turn_id FROM events
                          WHERE call_id=? AND run_id IS NOT NULL
@@ -201,26 +258,30 @@ class VaultSyncer:
             return
         plans = claude / "plans"
         if plans.is_dir():
-            for path in sorted(plans.glob("*.md")):
+            for path in sorted(self._discover_paths(plans, "*.md")):
                 run_id = self.plan_links.get(str(path.resolve()))
                 yield "claude", claude, path, "plan", run_id, None
         tasks = claude / "tasks"
         if tasks.is_dir():
-            for path in sorted(tasks.glob("*/*.json")):
+            for path in sorted(self._discover_paths(tasks, "*/*.json")):
                 vendor_id = path.parent.name
                 run_id = self.existing_run_id("claude", vendor_id, "main")
                 yield "claude", claude, path, "task", run_id, None
         teams = claude / "teams"
         if teams.is_dir():
-            for path in sorted(p for p in teams.rglob("*") if p.is_file() and not p.name.startswith(".")):
+            for path in sorted(p for p in self._discover_paths(teams, "*", recursive=True) if p.is_file() and not p.name.startswith(".")):
                 run_id = self._artifact_session_link(path)
                 yield "claude", claude, path, "team", run_id, None
         projects = claude / "projects"
         if projects.is_dir():
-            for path in sorted(projects.rglob("*")):
+            for path in sorted(self._discover_paths(projects, "*", recursive=True)):
+                parts = path.relative_to(projects).parts
+                if len(parts) >= 3 and parts[1] in {"memory", "memories"}:
+                    if (path.is_file() or path.is_symlink()) and path.name != ".DS_Store":
+                        yield "claude", claude, path, "project_memory", None, None
+                    continue
                 if not path.is_file() or path.suffix == ".jsonl":
                     continue
-                parts = path.relative_to(projects).parts
                 if "tool-results" in parts:
                     session_id = parts[parts.index("tool-results") - 1]
                     yield "claude", claude, path, "tool_result_file", self.existing_run_id("claude", session_id, "main"), None
@@ -236,7 +297,9 @@ class VaultSyncer:
             return
         raw = sum(_safe_size(source.path) for source in sources)
         if self.options.opencode_data:
-            raw += sum(_safe_size(path) for path in self.options.opencode_data.glob("opencode*.db"))
+            raw += sum(_safe_size(path) for path in self._discover_paths(self.options.opencode_data, "opencode*.db"))
+        if self.options.codex_home:
+            raw += sum(_sqlite_size_mtime(path)[0] for path in self._discover_paths(self.options.codex_home, "memories_*.sqlite") if path.is_file())
         stored_artifacts = sum(min(_safe_size(item[2]), self.options.artifact_max_bytes) for item in artifacts)
         required = int((raw + stored_artifacts) * 1.2)
         free = shutil.disk_usage(self.options.db_path.parent).free
@@ -883,7 +946,7 @@ class VaultSyncer:
         root = self.options.opencode_data
         if not root or not root.is_dir():
             return
-        databases = sorted(root.glob("opencode*.db"))
+        databases = sorted(self._discover_paths(root, "opencode*.db"))
         override = os.environ.get("OPENCODE_DB")
         if override:
             candidate = Path(override).expanduser()
@@ -895,7 +958,7 @@ class VaultSyncer:
     def _read_opencode_database(self, root: Path, path: Path) -> None:
         source_id = self.source_instance("opencode", root, f"sqlite:{path.name}")
         source_size, source_mtime = _sqlite_size_mtime(path)
-        with closing(self._readonly_sqlite(path)) as src:
+        with self._readonly_sqlite(path) as src:
             src.execute("BEGIN")
             tables = (
                 ("project", ("id",), "time_updated"),
@@ -1163,9 +1226,50 @@ class VaultSyncer:
         goals = root / "goals_1.sqlite"
         if goals.is_file():
             self._read_codex_goals(root, goals)
+        for path in sorted(self._discover_paths(root, "memories_*.sqlite")):
+            if path.is_file():
+                self._read_codex_memories(root, path)
 
-    def _readonly_sqlite(self, path: Path) -> sqlite3.Connection:
-        conn = sqlite3.connect(f"file:{path.resolve()}?mode=ro", uri=True, timeout=5)
+    def _read_codex_memories(self, root: Path, path: Path) -> None:
+        """Archive a standalone, consistent memory database including WAL data.
+
+        Keeping the native database preserves evolving memory schemas without
+        attributing shared context or memory worker state to a particular run.
+        """
+        source_id = self.source_instance("codex", root, "memories")
+        with self._readonly_sqlite(path) as src:
+            with tempfile.TemporaryDirectory(prefix="cairn-memory-") as temporary:
+                snapshot = Path(temporary) / path.name
+                with closing(sqlite3.connect(snapshot)) as target:
+                    src.backup(target)
+                    target.execute("PRAGMA journal_mode=DELETE")
+                    target.commit()
+                self.ingest_artifact("codex", Path(temporary), snapshot,
+                                     "memory_database", None, None, source_id=source_id)
+
+    @contextmanager
+    def _readonly_sqlite(self, path: Path) -> Iterable[sqlite3.Connection]:
+        path = path.resolve()
+        if self.options.snapshot_source_sqlite:
+            # For closed, copied histories only. APFS drivers on Windows may
+            # reject SQLite locks even for read-only connections. Preserve WAL
+            # data, but let SQLite rebuild SHM on the local temporary filesystem.
+            with tempfile.TemporaryDirectory(prefix="cairn-sqlite-") as temporary:
+                copied = Path(temporary) / path.name
+                shutil.copyfile(path, copied)
+                for suffix in ("-wal", "-journal"):
+                    sidecar = Path(f"{path}{suffix}")
+                    if sidecar.exists():
+                        shutil.copyfile(sidecar, Path(f"{copied}{suffix}"))
+                with closing(self._open_readonly_sqlite(copied)) as conn:
+                    yield conn
+        else:
+            with closing(self._open_readonly_sqlite(path)) as conn:
+                yield conn
+
+    @staticmethod
+    def _open_readonly_sqlite(path: Path) -> sqlite3.Connection:
+        conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=5)
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -1174,7 +1278,7 @@ class VaultSyncer:
 
     def _read_codex_state(self, root: Path, path: Path) -> None:
         source_id = self.source_instance("codex", root, "state")
-        with closing(self._readonly_sqlite(path)) as src, self.conn:
+        with self._readonly_sqlite(path) as src, self.conn:
             if self._table_exists(src, "threads"):
                 for row in src.execute("SELECT * FROM threads"):
                     data = dict(row)
@@ -1216,7 +1320,7 @@ class VaultSyncer:
                             self.ingest_artifact("codex", root, resolved, "thread_artifact_file", run_id, None, source_id=source_id)
 
     def _read_codex_turns(self, path: Path) -> None:
-        with closing(self._readonly_sqlite(path)) as src, self.conn:
+        with self._readonly_sqlite(path) as src, self.conn:
             if not self._table_exists(src, "thread_turns"):
                 return
             for row in src.execute("SELECT * FROM thread_turns"):
@@ -1226,7 +1330,7 @@ class VaultSyncer:
 
     def _read_codex_goals(self, root: Path, path: Path) -> None:
         source_id = self.source_instance("codex", root, "goals")
-        with closing(self._readonly_sqlite(path)) as src, self.conn:
+        with self._readonly_sqlite(path) as src, self.conn:
             if not self._table_exists(src, "thread_goals"):
                 return
             for row in src.execute("SELECT * FROM thread_goals"):
@@ -1241,7 +1345,7 @@ class VaultSyncer:
         if not root or not root.is_dir():
             return
         source_id = self.source_instance("claude", root, "desktop")
-        for path in sorted(root.rglob("*.json")):
+        for path in sorted(self._discover_paths(root, "*.json", recursive=True)):
             try:
                 data = json.loads(path.read_bytes())
             except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
@@ -1409,6 +1513,9 @@ class VaultSyncer:
         )
 
     def _mark_missing_files(self) -> None:
+        # An incomplete scan cannot establish that previously archived files vanished.
+        if self.discovery_errors:
+            return
         if not self.source_ids:
             return
         ids = tuple(self.source_ids.values())
