@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import fnmatch
 import json
@@ -37,6 +38,11 @@ class SyncOptions:
     claude_home: Path | None = None
     claude_app_support: Path | None = None
     opencode_data: Path | None = None
+    openchamber_data: Path | None = None
+    openchamber_chats: Path | None = None
+    # Look for `.openchamber/` and `.agents/loops/` in project folders on this
+    # machine. Off for imported archives, whose project paths are not local.
+    scan_project_dirs: bool = False
     artifact_max_bytes: int = DEFAULT_ARTIFACT_MAX
     max_record_bytes: int = DEFAULT_RECORD_MAX
     ignore_space_check: bool = False
@@ -82,8 +88,9 @@ class VaultSyncer:
         self.plan_links: dict[str, str] = {}
         self.referenced_uploads: set[Path] = set()
         self.discovery_errors: set[Path] = set()
+        self.opencode_file_links: dict[str, tuple[str, str | None]] = {}
 
-    def _discover_paths(self, root: Path, pattern: str, *, recursive: bool = False) -> Iterable[Path]:
+    def _discover_paths(self, root: Path, pattern: str, *, recursive: bool = False, prune: frozenset[str] = frozenset()) -> Iterable[Path]:
         """Scan each directory independently so a broken entry cannot hide siblings.
 
         Some Windows filesystem drivers report an empty directory as WinError 2.
@@ -111,7 +118,7 @@ class VaultSyncer:
                 matched = fnmatch.fnmatch(entry.name, parts[depth])
                 if matched and depth == len(parts) - 1:
                     yield path
-                if recursive or (matched and depth < len(parts) - 1):
+                if (recursive and entry.name not in prune) or (matched and depth < len(parts) - 1):
                     try:
                         if entry.is_dir(follow_symlinks=False):
                             pending.append((path, depth if recursive else depth + 1))
@@ -145,6 +152,7 @@ class VaultSyncer:
                 self.ingest_jsonl(source)
             self.ingest_codex_databases()
             self.ingest_opencode_databases()
+            self.ingest_openchamber_state()
             self.ingest_desktop_metadata()
             # Desktop metadata supplies authoritative plan-to-run links.
             for provider, root, path, kind, run_id, turn_id in self.discover_artifacts():
@@ -241,7 +249,8 @@ class VaultSyncer:
         tool_output = opencode / "tool-output" if opencode else None
         if tool_output and tool_output.is_dir():
             for path in sorted(p for p in self._discover_paths(tool_output, "*") if p.is_file() or p.is_symlink()):
-                linked = self.conn.execute(
+                # V1 names the file after the tool call; V2 records the path in tool metadata.
+                linked = self.opencode_file_links.get(f"tool-output:{path.name}") or self.conn.execute(
                     """SELECT run_id,turn_id FROM events
                          WHERE call_id=? AND run_id IS NOT NULL
                          ORDER BY sequence DESC LIMIT 1""",
@@ -252,6 +261,13 @@ class VaultSyncer:
                     str(linked[0]) if linked else None,
                     str(linked[1]) if linked and linked[1] else None,
                 )
+        shell = opencode / "shell" if opencode else None
+        if shell and shell.is_dir():
+            # Background shell output, one directory per OpenCode project id.
+            for path in sorted(p for p in self._discover_paths(shell, "*/*.out") if p.is_file()):
+                run_id, turn_id = self.opencode_file_links.get(f"shell:{path.stem}", (None, None))
+                yield "opencode", opencode, path, "shell_output", run_id, turn_id
+        yield from self.discover_openchamber_artifacts()
 
         claude = self.options.claude_home
         if not claude or not claude.is_dir():
@@ -356,10 +372,14 @@ class VaultSyncer:
     ) -> str:
         run_id = self.run_id(provider, vendor_id, stream_key)
         project_id = self.ensure_project(cwd) if cwd else None
+        existing = self.conn.execute("SELECT workload_id FROM runs WHERE id=?", (run_id,)).fetchone()
         if parent_vendor_id:
             parent_id = self.ensure_run(provider, parent_vendor_id, "main")
             parent = self.conn.execute("SELECT workload_id FROM runs WHERE id=?", (parent_id,)).fetchone()
             workload_id = str(parent[0]) if parent and parent[0] else f"workload:{parent_id}"
+        elif existing and existing[0]:
+            # A child already placed under its parent must not get a new empty workload.
+            workload_id = str(existing[0])
         else:
             workload_id = f"workload:{run_id}"
         self.conn.execute(
@@ -386,10 +406,11 @@ class VaultSyncer:
             ),
         )
         if not parent_vendor_id:
-            self.conn.execute(
-                "UPDATE workloads SET root_run_id=?, project_id=COALESCE(project_id,?), title=COALESCE(title,?) WHERE id=?",
-                (run_id, project_id, title, workload_id),
-            )
+            if workload_id == f"workload:{run_id}":
+                self.conn.execute(
+                    "UPDATE workloads SET root_run_id=?, project_id=COALESCE(project_id,?), title=COALESCE(title,?) WHERE id=?",
+                    (run_id, project_id, title, workload_id),
+                )
         else:
             self.link_runs(self.run_id(provider, parent_vendor_id, "main"), run_id, "spawn")
         return run_id
@@ -946,6 +967,7 @@ class VaultSyncer:
         root = self.options.opencode_data
         if not root or not root.is_dir():
             return
+        self._renormalize_opencode()
         databases = sorted(self._discover_paths(root, "opencode*.db"))
         override = os.environ.get("OPENCODE_DB")
         if override:
@@ -960,25 +982,58 @@ class VaultSyncer:
         source_size, source_mtime = _sqlite_size_mtime(path)
         with self._readonly_sqlite(path) as src:
             src.execute("BEGIN")
-            tables = (
-                ("project", ("id",), "time_updated"),
-                ("project_directory", ("project_id", "directory"), "time_created"),
-                ("workspace", ("id",), None),
-                ("session", ("id",), "time_updated"),
-                ("message", ("id",), "time_updated"),
-                ("part", ("id",), "time_updated"),
-                ("session_message", ("id",), "time_updated"),
-                ("session_input", ("id",), "time_created"),
-                ("session_context_epoch", ("session_id",), None),
-                ("todo", ("session_id", "position"), "time_updated"),
-            )
-            for table, keys, cursor_column in tables:
+            for table, keys, cursor_column, condition in _OPENCODE_TABLES:
                 if not self._table_exists(src, table):
                     continue
                 self._read_opencode_table(
                     src, root, path, source_id, table, keys, cursor_column,
-                    source_size, source_mtime,
+                    source_size, source_mtime, condition,
                 )
+
+    def _renormalize_opencode(self) -> None:
+        """Rebuild OpenCode rows normalized by an older reader from archived rows.
+
+        Earlier releases read OpenCode V2 session messages as one turn per
+        message and skipped their content blocks. The native rows are intact,
+        so the derived tables can be rebuilt without the source database.
+        """
+        row = self.conn.execute("SELECT value FROM vault_meta WHERE key='opencode_normalizer'").fetchone()
+        if row and row[0] == OPENCODE_NORMALIZER:
+            return
+        active = """SELECT r.id FROM raw_records r
+                      JOIN stream_records s ON s.raw_record_id=r.id
+                      JOIN source_instances i ON i.id=r.source_instance_id
+                     WHERE i.provider='opencode' AND i.surface LIKE 'sqlite:%'"""
+        with self.conn:
+            raw_ids = [int(value[0]) for value in self.conn.execute(active)]
+            for start in range(0, len(raw_ids), 500):
+                self._deactivate_raw_records(raw_ids[start:start + 500])
+            opencode_turns = "SELECT t.id FROM turns t JOIN runs r ON r.id=t.run_id WHERE r.provider='opencode'"
+            self.conn.execute(f"UPDATE artifacts SET turn_id=NULL WHERE turn_id IN ({opencode_turns})")
+            self.conn.execute(f"DELETE FROM turns WHERE id IN ({opencode_turns})")
+            # User rows anchor V2 turns, so they are rebuilt before the rows that follow them.
+            for table, _, _, _ in _OPENCODE_TABLES:
+                passes = (True, False) if table == "session_message" else (None,)
+                ids = [
+                    int(value[0]) for value in self.conn.execute(
+                        f"SELECT id FROM raw_records WHERE native_type=? AND id IN ({active}) ORDER BY id",
+                        (table,),
+                    )
+                ]
+                for users in passes:
+                    for raw_id in ids:
+                        raw = self.conn.execute("SELECT raw_zlib FROM raw_records WHERE id=? AND normalized=0", (raw_id,)).fetchone()
+                        if not raw:
+                            continue
+                        data = json.loads(zlib.decompress(raw[0]).decode("utf-8", "surrogatepass"))["row"]
+                        if users is not None and (data.get("type") == "user") != users:
+                            continue
+                        run_id = self._process_opencode_row(raw_id, table, data, None)
+                        self.conn.execute("UPDATE raw_records SET run_id=?,normalized=1 WHERE id=?", (run_id, raw_id))
+            self.conn.execute(
+                "INSERT INTO vault_meta(key,value) VALUES('opencode_normalizer',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (OPENCODE_NORMALIZER,),
+            )
 
     def _read_opencode_table(
         self,
@@ -991,6 +1046,7 @@ class VaultSyncer:
         cursor_column: str | None,
         source_size: int,
         source_mtime: int,
+        condition: str | None = None,
     ) -> None:
         relative = f"{path.name}/{table}.jsonl"
         logical_file = f"{path.name}:{table}"
@@ -1017,11 +1073,12 @@ class VaultSyncer:
             and (int(file_row["device"]), int(file_row["inode"])) != (stat.st_dev, stat.st_ino)
         )
         cursor = 0 if identity_changed else int(file_row["checkpoint_offset"])
+        where = f" AND ({condition})" if condition else ""
         if cursor_column:
-            query = f'SELECT * FROM "{table}" WHERE "{cursor_column}">=? ORDER BY "{cursor_column}"'
+            query = f'SELECT * FROM "{table}" WHERE "{cursor_column}">=?{where} ORDER BY "{cursor_column}"'
             rows = src.execute(query, (cursor,))
         else:
-            rows = src.execute(f'SELECT * FROM "{table}"')
+            rows = src.execute(f'SELECT * FROM "{table}" WHERE 1{where}')
         seen = 0
         maximum = cursor
         with self.conn:
@@ -1030,7 +1087,7 @@ class VaultSyncer:
                 key = "\0".join(str(data[name]) for name in keys)
                 if cursor_column:
                     maximum = max(maximum, _integer(data.get(cursor_column), 0))
-                if self._ingest_opencode_row(source_id, file_id, path.name, table, key, data):
+                if self._ingest_opencode_row(source_id, file_id, path.name, table, key, data, src):
                     self.stats.records_added += 1
                 seen += 1
             self.conn.execute(
@@ -1047,6 +1104,7 @@ class VaultSyncer:
         table: str,
         key: str,
         data: dict[str, Any],
+        src: sqlite3.Connection | None = None,
     ) -> bool:
         raw = (json_text({"table": table, "row": data}) + "\n").encode("utf-8", "surrogatepass")
         digest = hashlib.sha256(raw).hexdigest()
@@ -1079,31 +1137,44 @@ class VaultSyncer:
             (source_id, logical_key, raw_id),
         )
         if not row["normalized"]:
-            run_id = self._process_opencode_row(raw_id, table, data)
+            run_id = self._process_opencode_row(raw_id, table, data, src)
             self.conn.execute("UPDATE raw_records SET run_id=?,normalized=1 WHERE id=?", (run_id, raw_id))
         return bool(inserted.rowcount)
 
-    def _process_opencode_row(self, raw_id: int, table: str, data: dict[str, Any]) -> str | None:
-        if table == "session":
+    def _process_opencode_row(self, raw_id: int, table: str, data: dict[str, Any], src: sqlite3.Connection | None) -> str | None:
+        if table in {"session", "session_v2"}:
             vendor_id = str(data["id"])
             parent = _string(data.get("parent_id"))
+            metadata = _json_object(data.get("metadata"))
             run_id = self.ensure_run(
                 "opencode", vendor_id, "main", parent_vendor_id=parent,
-                surface="OpenCode", cwd=_string(data.get("directory")),
+                surface="OpenChamber" if "openchamber" in metadata else "OpenCode",
+                cwd=_string(data.get("directory")),
                 title=_string(data.get("title")), started_at=_time_value(data.get("time_created")),
                 metadata=data,
             )
+            # V2 stores the model as {"id","providerID","variant"}; V1 stored a name.
+            model = _json_object(data.get("model"))
             self.conn.execute(
                 """UPDATE runs SET status=?,model=COALESCE(?,model),reasoning_effort=COALESCE(?,reasoning_effort),
                      updated_at=COALESCE(?,updated_at) WHERE id=?""",
                 (
                     "archived" if data.get("time_archived") else "active",
-                    _string(data.get("model")), _string(data.get("agent")),
+                    _string(model.get("id")) if model else _string(data.get("model")),
+                    _string(model.get("variant")) if model else _string(data.get("agent")),
                     _time_value(data.get("time_updated")), run_id,
                 ),
             )
+            fork = _string(data.get("fork_session_id"))
+            if fork:
+                self.link_runs(
+                    self.ensure_run("opencode", fork, "main"), run_id, "fork",
+                    metadata={"fork_boundary": data.get("fork_boundary")},
+                )
             self.add_event(raw_id, run_id, None, _integer(data.get("time_created"), 0), 0, _time_value(data.get("time_created")), "context", data, item_type="session")
             return run_id
+        if table == "session_message" and "seq" in data and "role" not in _json_object(data.get("data")):
+            return self._process_opencode_v2_message(raw_id, data, src)
         if table in {"message", "session_message"}:
             return self._process_opencode_message(raw_id, data)
         if table == "part":
@@ -1121,7 +1192,168 @@ class VaultSyncer:
             run_id = self.ensure_run("opencode", str(data["session_id"]), "main")
             self.add_event(raw_id, run_id, None, _integer(data.get("baseline_seq"), 0), 0, None, "context", data, item_type="session_context_epoch")
             return run_id
+        if table in {"session_inbox", "session_pending"}:
+            # Queued input before admission. Delivered input reappears as a
+            # session message, so these stay status events and are not counted twice.
+            run_id = self.ensure_run("opencode", str(data["session_id"]), "main")
+            sequence = _integer(data.get("enqueued_seq", data.get("admitted_seq")), 0)
+            self.add_event(raw_id, run_id, None, sequence, 0, _time_value(data.get("time_created")), "status", data, role="user", item_type=f"{table}:{data.get('type')}", message_id=str(data["id"]))
+            return run_id
+        if table in {"instruction_state", "instruction_entry"}:
+            run_id = self.ensure_run("opencode", str(data["session_id"]), "main")
+            sequence = _integer(data.get("through_seq", data.get("time_created")), 0)
+            self.add_event(raw_id, run_id, None, sequence, 0, _time_value(data.get("time_updated")), "instruction", data, role="system", item_type=table)
+            return run_id
+        if table == "kv":
+            value = _json_object(data.get("value"))
+            recovery = value.get("recovery") if isinstance(value.get("recovery"), dict) else {}
+            session = _string(recovery.get("sessionID"))
+            if not session:
+                return None
+            run_id = self.ensure_run("opencode", session, "main")
+            shell = _string(recovery.get("shellID") or value.get("id"))
+            self.add_event(raw_id, run_id, None, _integer(data.get("time_created"), 0), 0, _time_value(data.get("time_updated")), "status", value, item_type="background_job", tool_name=_string(recovery.get("kind")), message_id=_string(value.get("notificationID")))
+            if shell:
+                self._link_opencode_file(f"shell:{shell}", run_id, None)
+            return run_id
         return None
+
+    def _process_opencode_v2_message(self, raw_id: int, data: dict[str, Any], src: sqlite3.Connection | None) -> str:
+        """Normalize an OpenCode V2 session message.
+
+        V2 keeps one row per message with its content blocks inline and no
+        parent pointer, so a turn is the latest user message at or before it.
+        """
+        session = str(data["session_id"])
+        run_id = self.ensure_run("opencode", session, "main")
+        payload = _json_object(data.get("data"))
+        message_type = _string(data.get("type")) or "unknown"
+        message_id = str(data["id"])
+        sequence = _integer(data.get("seq"), 0)
+        timestamp = _time_value(_nested(payload, "time", "created") or data.get("time_created"))
+        if message_type == "user":
+            turn_id = self.ensure_turn(run_id, message_id, sequence=sequence, started=timestamp)
+            self.conn.execute("UPDATE turns SET status='running' WHERE id=? AND status IS NULL", (turn_id,))
+        else:
+            anchor = self._opencode_turn_anchor(run_id, session, sequence, src)
+            turn_id = self.ensure_turn(run_id, anchor) if anchor else None
+
+        def event(sub: int, kind: str, value: Any, **fields: Any) -> None:
+            self.add_event(raw_id, run_id, turn_id, sequence, sub, timestamp, kind, value, message_id=message_id, **fields)
+
+        if message_type == "user":
+            event(0, "message", payload, role="user", item_type="text")
+            files = payload.get("files") if isinstance(payload.get("files"), list) else []
+            for sub, item in enumerate(files, 1):
+                event(sub, "attachment", item, role="user", item_type="file")
+        elif message_type == "assistant":
+            self._process_opencode_v2_assistant(raw_id, run_id, turn_id, sequence, timestamp, message_id, payload)
+        elif message_type in {"synthetic", "system"}:
+            event(0, "instruction", payload, role="user" if message_type == "synthetic" else "system", item_type=message_type)
+        elif message_type == "compaction":
+            event(0, "context", payload, role="assistant", item_type=message_type)
+            if isinstance(payload.get("tokens"), dict):
+                self._insert_opencode_usage(raw_id, run_id, turn_id, sequence, timestamp, message_id, payload["tokens"], payload)
+        elif message_type == "idle":
+            event(0, "status", payload, item_type=message_type)
+            outcome = _string(payload.get("outcome"))
+            if turn_id and outcome:
+                self.conn.execute(
+                    "UPDATE turns SET status=?,completed_at=COALESCE(?,completed_at) WHERE id=?",
+                    ("completed" if outcome == "succeeded" else outcome, timestamp, turn_id),
+                )
+        elif message_type in {"agent-switched", "model-switched", "location-switched"}:
+            event(0, "context", payload, item_type=message_type)
+        else:
+            event(0, "unknown", payload or data, item_type=message_type)
+            self.warn_for_raw(raw_id, "unknown_opencode_message", f"unknown OpenCode message type {message_type!r}")
+        return run_id
+
+    def _process_opencode_v2_assistant(
+        self,
+        raw_id: int,
+        run_id: str,
+        turn_id: str | None,
+        sequence: int,
+        timestamp: str | None,
+        message_id: str,
+        payload: dict[str, Any],
+    ) -> None:
+        def event(sub: int, kind: str, value: Any, **fields: Any) -> None:
+            self.add_event(raw_id, run_id, turn_id, sequence, sub, timestamp, kind, value, role="assistant", message_id=message_id, **fields)
+
+        content = payload.get("content") if isinstance(payload.get("content"), list) else []
+        sub = 0
+        for block in content:
+            if not isinstance(block, dict):
+                block = {"type": "unknown", "value": block}
+            block_type = _string(block.get("type")) or "unknown"
+            if block_type == "text":
+                event(sub, "message", block, item_type=block_type)
+            elif block_type == "reasoning":
+                event(sub, "reasoning", block, item_type=block_type)
+            elif block_type == "tool":
+                state = block.get("state") if isinstance(block.get("state"), dict) else {}
+                tool, call_id = _string(block.get("name")), _string(block.get("id"))
+                event(sub, "tool_call", block, item_type=block_type, tool_name=tool, call_id=call_id)
+                if state.get("status") in {"completed", "error"} or "content" in state or "error" in state:
+                    sub += 1
+                    event(sub, "tool_result", block, item_type=block_type, tool_name=tool, call_id=call_id)
+                metadata = state.get("metadata") if isinstance(state.get("metadata"), dict) else {}
+                output_path = _string(metadata.get("outputPath"))
+                if output_path:
+                    self._link_opencode_file(f"tool-output:{_basename(output_path)}", run_id, turn_id)
+                shell = _string(metadata.get("shellID"))
+                if shell:
+                    self._link_opencode_file(f"shell:{shell}", run_id, turn_id)
+                created = _openchamber_created_session(tool, state)
+                child = self.existing_run_id("opencode", created, "main") if created else None
+                if child:
+                    # OpenChamber's session.create starts a separate root session for this one.
+                    self.link_runs(run_id, child, "dispatch", metadata={"call_id": call_id, "message_id": message_id})
+            else:
+                event(sub, "unknown", block, item_type=block_type)
+                self.warn_for_raw(raw_id, "unknown_opencode_part", f"unknown OpenCode content block {block_type!r}")
+            sub += 1
+        if payload.get("error") is not None:
+            event(sub, "status", {"error": payload["error"], "finish": payload.get("finish")}, item_type="error")
+        elif not content:
+            event(sub, "message", payload, item_type="message")
+        model = _string(_nested(payload, "model", "id"))
+        if model:
+            self.conn.execute("UPDATE runs SET model=COALESCE(?,model) WHERE id=?", (model, run_id))
+        if isinstance(payload.get("tokens"), dict):
+            self._insert_opencode_usage(raw_id, run_id, turn_id, sequence, timestamp, message_id, payload["tokens"], payload)
+
+    def _opencode_turn_anchor(self, run_id: str, session: str, sequence: int, src: sqlite3.Connection | None) -> str | None:
+        if src is not None:
+            row = src.execute(
+                "SELECT id FROM session_message WHERE session_id=? AND type='user' AND seq<? ORDER BY seq DESC LIMIT 1",
+                (session, sequence),
+            ).fetchone()
+        else:
+            row = self.conn.execute(
+                "SELECT vendor_turn_id FROM turns WHERE run_id=? AND sequence<? ORDER BY sequence DESC LIMIT 1",
+                (run_id, sequence),
+            ).fetchone()
+        return str(row[0]) if row else None
+
+    def _link_opencode_file(self, key: str, run_id: str, turn_id: str | None) -> None:
+        """Remember which run produced an externalized OpenCode file.
+
+        Files are archived after the database, and a later version of a file
+        inherits the link, so the link only has to be seen once.
+        """
+        self.opencode_file_links[key] = (run_id, turn_id)
+        kind, name = key.split(":", 1)
+        escaped = _like_escape(name)
+        pattern = f"tool-output/{escaped}" if kind == "tool-output" else f"shell/%/{escaped}.out"
+        self.conn.execute(
+            """UPDATE artifacts SET run_id=COALESCE(run_id,?),turn_id=COALESCE(turn_id,?)
+                WHERE kind=? AND relative_path LIKE ? ESCAPE '\\'
+                  AND source_instance_id IN (SELECT id FROM source_instances WHERE provider='opencode')""",
+            (run_id, turn_id, "tool_output" if kind == "tool-output" else "shell_output", pattern),
+        )
 
     def _process_opencode_message(self, raw_id: int, data: dict[str, Any]) -> str:
         vendor_session = str(data["session_id"])
@@ -1365,6 +1597,133 @@ class VaultSyncer:
                     self.plan_links[str(Path(plan_path).expanduser().resolve())] = run_id
             self.ingest_artifact("claude", root, path, "desktop_session", run_id, None, source_id=source_id)
 
+    def discover_openchamber_artifacts(self) -> Iterable[tuple[str, Path, Path, str, str | None, str | None]]:
+        """Yield OpenChamber's run and project files from an explicit allowlist.
+
+        Everything else under its data directory is configuration, caches,
+        runtime state, or credentials, and is never read.
+        """
+        root = self.options.openchamber_data
+        if root and root.is_dir():
+            for pattern, kind in _OPENCHAMBER_FILES:
+                for path in sorted(self._discover_paths(root, pattern)):
+                    if not path.is_file() or path.is_symlink() or _transient_name(path.name):
+                        continue
+                    run_id = self.existing_run_id("opencode", path.stem, "main") if kind == "goal" else None
+                    yield "opencode", root, path, kind, run_id, None
+        chat_runs: dict[Path, str | None] = {}
+        for chats in self._openchamber_chat_roots():
+            # Working folders of project-less chats, one per chat session.
+            for path in sorted(self._discover_paths(chats, "*", recursive=True, prune=_WORKSPACE_PRUNE)):
+                if not path.is_file() or path.name == ".DS_Store":
+                    continue
+                parts = path.relative_to(chats).parts
+                if len(parts) < 3:
+                    continue
+                folder = chats.joinpath(*parts[:2])
+                if folder not in chat_runs:
+                    row = self.conn.execute(
+                        "SELECT id FROM runs WHERE provider='opencode' AND cwd=? ORDER BY started_at LIMIT 1",
+                        (str(folder),),
+                    ).fetchone()
+                    chat_runs[folder] = str(row[0]) if row else None
+                yield "opencode", chats, path, "chat_workspace", chat_runs[folder], None
+        for project in self._openchamber_project_dirs():
+            yield from self._discover_project_files(project)
+
+    def _discover_project_files(self, project: Path) -> Iterable[tuple[str, Path, Path, str, str | None, str | None]]:
+        local = project / ".openchamber"
+        if local.is_dir() and not local.is_symlink():
+            for path in sorted(self._discover_paths(local, "*", recursive=True, prune=_WORKSPACE_PRUNE)):
+                if not path.is_file() or path.is_symlink() or path.name == ".DS_Store" or _transient_name(path.name):
+                    continue
+                parts = path.relative_to(local).parts
+                # Only what OpenChamber writes here; e.g. ~/.openchamber/npm-global is an install tree.
+                kind = "project_shared_config" if parts == ("project.json",) else {"plans": "plan", "screenshots": "screenshot"}.get(parts[0])
+                if kind and len(parts) > (0 if kind == "project_shared_config" else 1):
+                    yield "opencode", project, path, kind, None, None
+            plans = _shared_plans_dir(local / "project.json")
+            if plans and plans != ".openchamber/plans" and (project / plans).is_dir():
+                for path in sorted(self._discover_paths(project / plans, "*.md")):
+                    if path.is_file() and not path.is_symlink() and _PLAN_NAME.match(path.name):
+                        yield "opencode", project, path, "plan", None, None
+        loops = project / ".agents" / "loops"
+        if loops.is_dir() and not loops.is_symlink():
+            for path in sorted(self._discover_paths(loops, "*.md")):
+                if path.is_file() and not path.is_symlink():
+                    yield "opencode", project, path, "loop", None, None
+
+    def _openchamber_chat_roots(self) -> list[Path]:
+        roots = []
+        if self.options.openchamber_data:
+            roots.append(self.options.openchamber_data / "chats")
+        if self.options.openchamber_chats:
+            roots.append(self.options.openchamber_chats)
+        unique = []
+        for root in roots:
+            if root.is_dir() and not root.is_symlink() and root.resolve() not in unique:
+                unique.append(root.resolve())
+        return unique
+
+    def _openchamber_project_dirs(self) -> list[Path]:
+        """Folders that may hold `.openchamber/` or `.agents/loops/` on this machine."""
+        if not self.options.scan_project_dirs:
+            return []
+        candidates: set[str] = set()
+        root = self.options.openchamber_data
+        if root and root.is_dir():
+            # Only the project list is read from settings.json; nothing else in it is kept.
+            settings = _read_json(root / "settings.json")
+            for project in settings.get("projects", []) if isinstance(settings.get("projects"), list) else []:
+                if isinstance(project, dict) and isinstance(project.get("path"), str):
+                    candidates.add(project["path"])
+            for path in self._discover_paths(root, "projects/path_*.json"):
+                decoded = _openchamber_project_path(path.stem)
+                if decoded:
+                    candidates.add(decoded)
+                personal = _read_json(path).get("projectPath")
+                if isinstance(personal, str):
+                    candidates.add(personal)
+        for (value,) in self.conn.execute(
+            """SELECT cwd FROM runs WHERE provider='opencode' AND cwd IS NOT NULL
+               UNION SELECT p.repo_root FROM projects p
+                WHERE p.repo_root IS NOT NULL
+                  AND EXISTS(SELECT 1 FROM runs r WHERE r.project_id=p.id AND r.provider='opencode')"""
+        ):
+            candidates.add(str(value))
+        excluded = [path for path in (root, *self._openchamber_chat_roots()) if path]
+        result = []
+        for candidate in candidates:
+            path = Path(candidate).expanduser()
+            if not path.is_absolute():
+                continue
+            try:
+                path = path.resolve()
+                if not path.is_dir():
+                    continue
+            except OSError:
+                continue
+            if any(path == other.resolve() or path.is_relative_to(other.resolve()) for other in excluded):
+                continue
+            result.append(path)
+        return sorted(set(result))
+
+    def ingest_openchamber_state(self) -> None:
+        """Apply OpenChamber's archive state, which overrides OpenCode's flag.
+
+        Dispatch lineage comes from `session.create` tool calls in OpenCode's
+        history instead of `dispatch-results.json`, which only lists pending
+        deliveries, and delivered results, which sessions send each other both ways.
+        """
+        root = self.options.openchamber_data
+        if not root or not root.is_dir():
+            return
+        with self.conn:
+            for session, archived_at in _read_json(root / "sessions-archive.json").items():
+                run_id = self.existing_run_id("opencode", str(session), "main")
+                if run_id and archived_at:
+                    self.conn.execute("UPDATE runs SET status='archived' WHERE id=?", (run_id,))
+
     def ingest_artifact(self, provider: str, root: Path, path: Path, kind: str, run_id: str | None, turn_id: str | None, *, source_id: int | None = None) -> None:
         source_id = source_id or self.source_instance(provider, root, "artifacts")
         try:
@@ -1424,6 +1783,16 @@ class VaultSyncer:
             run_id = None
         if turn_id and not self.conn.execute("SELECT 1 FROM turns WHERE id=?", (turn_id,)).fetchone():
             turn_id = None
+        if run_id is None:
+            # A new version of a growing file belongs to the run that made the first one.
+            earlier = self.conn.execute(
+                """SELECT run_id,turn_id FROM artifacts
+                    WHERE source_instance_id=? AND relative_path=? AND run_id IS NOT NULL
+                    ORDER BY captured_at DESC LIMIT 1""",
+                (source_id, relative),
+            ).fetchone()
+            if earlier:
+                run_id, turn_id = earlier
         artifact_id = stable_id("artifact", source_id, relative, sha)
         cur = self.conn.execute(
             """INSERT OR IGNORE INTO artifacts(id,source_instance_id,run_id,turn_id,kind,relative_path,
@@ -1433,6 +1802,11 @@ class VaultSyncer:
         )
         if cur.rowcount:
             self.stats.artifacts_added += 1
+        elif run_id:
+            self.conn.execute(
+                "UPDATE artifacts SET run_id=COALESCE(run_id,?),turn_id=COALESCE(turn_id,?) WHERE id=?",
+                (run_id, turn_id, artifact_id),
+            )
 
     def ingest_referenced_uploads(self) -> None:
         root = self.options.claude_home
@@ -1503,6 +1877,8 @@ class VaultSyncer:
         return project_id
 
     def _resolve_workloads(self) -> None:
+        # Earlier releases left an empty workload behind when a child run was touched without its parent.
+        self.conn.execute("DELETE FROM workloads WHERE NOT EXISTS(SELECT 1 FROM runs WHERE runs.workload_id=workloads.id)")
         self.conn.execute(
             """UPDATE workloads SET
                  title=COALESCE(title,(SELECT title FROM runs WHERE id=root_run_id)),
@@ -1567,6 +1943,34 @@ _TOKEN_COLUMNS = (
     "output_tokens", "reasoning_tokens", "total_tokens",
 )
 
+# Bump when OpenCode normalization changes; older vaults are rebuilt from archived rows.
+OPENCODE_NORMALIZER = "2"
+
+# (table, key columns, incremental cursor column, row filter). Sessions come
+# first so runs exist before their messages. OpenCode's `event` journal,
+# credentials, accounts, permissions, and the cached model catalog in `kv`
+# are deliberately absent; only background-job records are kept from `kv`.
+_OPENCODE_TABLES: tuple[tuple[str, tuple[str, ...], str | None, str | None], ...] = (
+    ("project", ("id",), "time_updated", None),
+    ("project_directory", ("project_id", "directory"), "time_created", None),
+    ("workspace", ("id",), None, None),
+    ("worktree", ("project_id", "directory"), "time_created", None),
+    ("session", ("id",), "time_updated", None),
+    ("session_v2", ("id",), "time_updated", None),
+    ("message", ("id",), "time_updated", None),
+    ("part", ("id",), "time_updated", None),
+    ("session_message", ("id",), "time_updated", None),
+    ("session_input", ("id",), "time_created", None),
+    ("session_inbox", ("id",), "time_created", None),
+    ("session_pending", ("id",), "time_created", None),
+    ("session_context_epoch", ("session_id",), None, None),
+    ("instruction_blob", ("hash",), None, None),
+    ("instruction_state", ("session_id",), None, None),
+    ("instruction_entry", ("session_id", "key"), "time_updated", None),
+    ("todo", ("session_id", "position"), "time_updated", None),
+    ("kv", ("key",), "time_updated", "\"key\" LIKE 'job.%'"),
+)
+
 
 def normalize_git_remote(remote: str) -> str:
     remote = remote.strip()
@@ -1611,6 +2015,87 @@ def _structured_paths(value: Any) -> Iterable[str]:
     elif isinstance(value, list):
         for item in value:
             yield from _structured_paths(item)
+
+
+# OpenChamber files that hold run or project content, relative to its data
+# directory. Settings, preferences, credentials, tokens, caches, logs, and
+# runtime state are left out on purpose.
+_OPENCHAMBER_FILES = (
+    ("goals/*.md", "goal"),
+    ("dispatch-results.json", "dispatch_results"),
+    ("sessions-archive.json", "session_archive"),
+    ("sessions-directories.json", "session_folders"),
+    ("sessions-metadata.json*", "session_metadata"),
+    ("message-queue.json", "message_queue"),
+    ("memory.json", "agent_memory"),
+    ("linear-session-status.json", "linear_links"),
+    ("projects/*.json", "project_config"),
+    ("projects/*/context.json", "project_context"),
+    ("projects/*/memory.json", "agent_memory"),
+    ("projects/*/plans/*.md", "plan"),
+    ("guest-storage/*.json", "extension_state"),
+    ("walkthroughs/*/*.json", "walkthrough"),
+    ("spaces/archive/*.json", "space_archive"),
+    ("spaces/archive/*/*.json", "space_archive"),
+)
+_WORKSPACE_PRUNE = frozenset({".git", "node_modules", ".venv", "venv", "__pycache__", ".cache"})
+_PLAN_NAME = re.compile(r"^[a-zA-Z0-9._-]+\.md$")
+
+
+def _transient_name(name: str) -> bool:
+    return name.endswith(".lock") or ".tmp-" in name or ".corrupt-" in name
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_bytes())
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _openchamber_project_path(stem: str) -> str | None:
+    """Decode `path_<base64url(path)>`; hashed stems cannot be decoded."""
+    encoded = stem.removeprefix("path_")
+    if encoded == stem or encoded.startswith("sha256_"):
+        return None
+    try:
+        return base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+def _openchamber_created_session(tool: str | None, state: dict[str, Any]) -> str | None:
+    """The session id returned by a successful OpenChamber `session.create` call."""
+    if tool != "openchamber" or _nested(state, "input", "action") != "session.create":
+        return None
+    for block in state.get("content") if isinstance(state.get("content"), list) else []:
+        if isinstance(block, dict) and isinstance(block.get("text"), str):
+            result = _json_object(block["text"])
+            if result.get("ok") and _nested(result, "data", "sessionId"):
+                return str(_nested(result, "data", "sessionId"))
+    return None
+
+
+def _shared_plans_dir(project_json: Path) -> str | None:
+    """The repository's shared plans folder, as OpenChamber resolves it."""
+    if not project_json.is_file():
+        return None
+    value = _read_json(project_json).get("plansDir")
+    if not isinstance(value, str) or not value.strip():
+        return ".openchamber/plans"
+    value = value.strip().replace("\\", "/").rstrip("/")
+    if value.startswith("/") or re.match(r"^[A-Za-z]:", value) or any(part in {"", ".", ".."} for part in value.split("/")):
+        return None
+    return value
+
+
+def _like_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _basename(value: str) -> str:
+    return re.split(r"[\\/]", value)[-1]
 
 
 def _string(value: Any) -> str | None:
