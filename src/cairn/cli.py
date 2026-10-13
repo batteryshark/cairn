@@ -16,7 +16,7 @@ from .reporting import export_native, export_unified, print_status, status_data,
 
 
 def parser() -> argparse.ArgumentParser:
-    result = argparse.ArgumentParser(prog="cairn", description="Archive Claude Code, Codex, and OpenCode runs in one SQLite vault")
+    result = argparse.ArgumentParser(prog="cairn", description="Archive Claude Code, Codex, OpenCode, and OpenChamber runs in one SQLite vault")
     sub = result.add_subparsers(dest="command", required=True)
 
     sync = sub.add_parser("sync", help="incrementally ingest local or copied histories")
@@ -26,6 +26,7 @@ def parser() -> argparse.ArgumentParser:
     sync.add_argument("--claude-home", type=Path, help="path to a .claude directory")
     sync.add_argument("--claude-app-support", type=Path, help="path to Claude/claude-code-sessions")
     sync.add_argument("--opencode-data", type=Path, help="path to an OpenCode data directory")
+    sync.add_argument("--openchamber-data", type=Path, help="path to an OpenChamber data directory (.config/openchamber)")
     sync.add_argument("--artifact-max-bytes", type=_positive_int, default=DEFAULT_ARTIFACT_MAX)
     sync.add_argument("--max-record-bytes", type=_positive_int, default=DEFAULT_RECORD_MAX)
     sync.add_argument("--ignore-space-check", action="store_true")
@@ -91,7 +92,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _sync(args: argparse.Namespace) -> int:
-    explicit = any((args.codex_home, args.claude_home, args.claude_app_support, args.opencode_data))
+    explicit = any((args.codex_home, args.claude_home, args.claude_app_support, args.opencode_data, args.openchamber_data))
     if explicit and not args.host_id:
         raise ValueError("--host-id is required when importing explicit source roots")
     home = Path.home()
@@ -100,16 +101,21 @@ def _sync(args: argparse.Namespace) -> int:
         claude = _pinned_directory(args.claude_home, "--claude-home")
         app = _pinned_directory(args.claude_app_support, "--claude-app-support")
         opencode = _pinned_directory(args.opencode_data, "--opencode-data")
+        openchamber = _pinned_directory(args.openchamber_data, "--openchamber-data")
+        chats = None
     else:
         codex = _optional_directory(home / ".codex")
         claude = _optional_directory(home / ".claude")
         app = _auto_claude_app_support(home)
         opencode = _auto_opencode_data(home)
-    if not any((codex, claude, app, opencode)):
-        raise RuntimeError("no Codex, Claude, or OpenCode history roots were found")
+        openchamber = _auto_openchamber_data(home)
+        chats = _auto_openchamber_chats()
+    if not any((codex, claude, app, opencode, openchamber)):
+        raise RuntimeError("no Codex, Claude, OpenCode, or OpenChamber history roots were found")
     options = SyncOptions(
         db_path=args.vault.expanduser().resolve(), host_id=args.host_id or socket.gethostname(),
         codex_home=codex, claude_home=claude, claude_app_support=app, opencode_data=opencode,
+        openchamber_data=openchamber, openchamber_chats=chats, scan_project_dirs=not explicit,
         artifact_max_bytes=args.artifact_max_bytes, max_record_bytes=args.max_record_bytes,
         ignore_space_check=args.ignore_space_check,
         snapshot_source_sqlite=args.snapshot_source_sqlite,
@@ -140,6 +146,16 @@ def _optional_directory(path: Path) -> Path | None:
 def _auto_opencode_data(home: Path) -> Path | None:
     xdg = os.environ.get("XDG_DATA_HOME")
     return _optional_directory((Path(xdg).expanduser() if xdg else home / ".local" / "share") / "opencode")
+
+
+def _auto_openchamber_data(home: Path) -> Path | None:
+    configured = os.environ.get("OPENCHAMBER_DATA_DIR", "").strip()
+    return _optional_directory(Path(configured).expanduser() if configured else home / ".config" / "openchamber")
+
+
+def _auto_openchamber_chats() -> Path | None:
+    configured = os.environ.get("OPENCHAMBER_CHATS_DIR", "").strip()
+    return _optional_directory(Path(configured).expanduser()) if configured else None
 
 
 def _auto_claude_app_support(home: Path) -> Path | None:

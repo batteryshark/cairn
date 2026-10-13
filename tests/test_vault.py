@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import shutil
 import sqlite3
@@ -40,7 +41,8 @@ def write_lines(path: Path, values: list[object], *, partial: object | None = No
 class VaultTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp.name)
+        # Resolved so macOS /var -> /private/var matches the vault's resolved roots.
+        self.root = Path(self.temp.name).resolve()
         self.codex = self.root / ".codex"
         self.claude = self.root / ".claude"
         self.desktop = self.root / "claude-code-sessions"
@@ -223,6 +225,187 @@ class VaultTest(unittest.TestCase):
         self.assertEqual(data["workloads"], 3)
         self.assertEqual(data["unresolved_children"], 0)
         conn.close()
+
+    def _make_opencode_v2(self) -> Path:
+        root = self.root / "opencode-v2"
+        root.mkdir()
+        conn = sqlite3.connect(root / "opencode.db")
+        conn.executescript(
+            """
+            CREATE TABLE project(id TEXT PRIMARY KEY,worktree TEXT,vcs TEXT,name TEXT,time_created INTEGER,time_updated INTEGER,sandboxes TEXT);
+            CREATE TABLE session_v2(id TEXT PRIMARY KEY,project_id TEXT,parent_id TEXT,fork_session_id TEXT,fork_boundary TEXT,slug TEXT,directory TEXT,title TEXT,version TEXT,metadata TEXT,agent TEXT,model TEXT,time_created INTEGER,time_updated INTEGER,time_archived INTEGER);
+            CREATE TABLE session_message(id TEXT PRIMARY KEY,session_id TEXT,type TEXT,seq INTEGER,time_created INTEGER,time_updated INTEGER,data TEXT);
+            CREATE TABLE session_inbox(id TEXT PRIMARY KEY,session_id TEXT,type TEXT,payload TEXT,delivery TEXT,enqueued_seq INTEGER,time_created INTEGER);
+            CREATE TABLE instruction_blob(hash TEXT PRIMARY KEY,value TEXT);
+            CREATE TABLE instruction_state(session_id TEXT PRIMARY KEY,epoch_start INTEGER,through_seq INTEGER,initial_values TEXT,current_values TEXT);
+            CREATE TABLE kv(key TEXT PRIMARY KEY,value TEXT,time_created INTEGER,time_updated INTEGER);
+            CREATE TABLE credential(id TEXT PRIMARY KEY,label TEXT,value TEXT,time_created INTEGER,time_updated INTEGER);
+            CREATE TABLE event(id TEXT PRIMARY KEY,data TEXT);
+            """
+        )
+        now = 1_791_000_000_000
+        model = json.dumps({"id": "model-v2", "providerID": "fixture", "variant": "high"})
+        conn.execute("INSERT INTO project VALUES(?,?,?,?,?,?,?)", ("proj-v2", str(self.root / "repo"), "git", "fixture", now, now, "[]"))
+        sessions = [
+            ("ses_v2_root", None, None, "Root V2", '{"openchamber":{"delivered":"on"}}'),
+            ("ses_v2_child", "ses_v2_root", None, "Child V2", None),
+            ("ses_v2_fork", None, "ses_v2_root", "Fork V2", None),
+        ]
+        for offset, (sid, parent, fork, title, metadata) in enumerate(sessions):
+            conn.execute(
+                "INSERT INTO session_v2 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (sid, "proj-v2", parent, fork, "msg_boundary" if fork else None, sid, str(self.root / "repo"), title, "2.0", metadata, "build", model, now + offset, now + offset, None),
+            )
+        tool = {
+            "type": "tool", "id": "call_v2", "name": "webfetch",
+            "state": {"status": "completed", "input": {"url": "https://example.com"}, "content": [{"type": "text", "text": "ok"}],
+                      "metadata": {"outputPath": str(root / "tool-output" / "tool_v2"), "shellID": "sh_v2"}},
+        }
+        messages = [
+            ("synthetic", {"time": {"created": now + 1}, "text": "reminder"}),
+            ("user", {"time": {"created": now + 2}, "text": "do it", "files": [{"path": "a.png"}]}),
+            ("assistant", {"time": {"created": now + 3}, "model": {"id": "model-v2"}, "content": [
+                {"type": "reasoning", "text": "thinking"}, {"type": "text", "text": "working"}, tool,
+            ]}),
+            ("assistant", {"time": {"created": now + 4, "completed": now + 5}, "model": {"id": "model-v2"}, "content": [{"type": "text", "text": "done"}],
+                           "tokens": {"input": 11, "output": 7, "reasoning": 3, "cache": {"read": 2, "write": 1}}, "cost": 0.1}),
+            ("idle", {"time": {"created": now + 6}, "outcome": "succeeded"}),
+            ("model-switched", {"time": {"created": now + 7}, "model": {"id": "other"}}),
+        ]
+        for seq, (kind, data) in enumerate(messages, 1):
+            conn.execute("INSERT INTO session_message VALUES(?,?,?,?,?,?,?)", (f"msg_v2_{seq}", "ses_v2_root", kind, seq, now + seq, now + seq, json.dumps(data)))
+        conn.execute("INSERT INTO session_inbox VALUES(?,?,?,?,?,?,?)", ("inbox_v2", "ses_v2_root", "synthetic", '{"text":"steer"}', "steer", 9, now + 9))
+        conn.execute("INSERT INTO instruction_blob VALUES(?,?)", ("hash-1", '"system prompt"'))
+        conn.execute("INSERT INTO instruction_state VALUES(?,?,?,?,?)", ("ses_v2_root", 1, 6, '{"core":"hash-1"}', '{"core":"hash-1"}'))
+        job = {"id": "sh_v2", "recovery": {"kind": "shell", "sessionID": "ses_v2_root", "shellID": "sh_v2"}, "status": "running"}
+        conn.execute("INSERT INTO kv VALUES(?,?,?,?)", ("job.background/msg_v2_3", json.dumps(job), now, now))
+        conn.execute("INSERT INTO kv VALUES(?,?,?,?)", ("models-dev:catalog", '{"huge":"cache"}', now, now))
+        conn.execute("INSERT INTO credential VALUES(?,?,?,?,?)", ("cred", "token", "secret-value", now, now))
+        conn.commit()
+        conn.close()
+        (root / "tool-output").mkdir()
+        (root / "tool-output" / "tool_v2").write_text("full output", encoding="utf-8")
+        (root / "shell" / "proj-v2").mkdir(parents=True)
+        (root / "shell" / "proj-v2" / "sh_v2.out").write_text("shell output", encoding="utf-8")
+        (root / "shell" / "proj-v2" / "sh_unlinked.out").write_text("foreground", encoding="utf-8")
+        return root
+
+    def test_opencode_v2_sessions_turns_blocks_and_files(self) -> None:
+        root = self._make_opencode_v2()
+        conn = open_database(self.vault)
+        self.addCleanup(conn.close)
+        options = self.options(codex_home=None, claude_home=None, claude_app_support=None, opencode_data=root, artifact_max_bytes=1024)
+        VaultSyncer(conn, options).sync()
+        run = lambda sid: f"opencode:fixture-host:{sid}:main"
+        root_run = conn.execute("SELECT * FROM runs WHERE id=?", (run("ses_v2_root"),)).fetchone()
+        self.assertEqual((root_run["title"], root_run["model"], root_run["reasoning_effort"], root_run["surface"]), ("Root V2", "model-v2", "high", "OpenChamber"))
+        edges = {(row[0], row[1]) for row in conn.execute("SELECT child_run_id,relation FROM run_edges")}
+        self.assertEqual(edges, {(run("ses_v2_child"), "spawn"), (run("ses_v2_fork"), "fork")})
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM workloads").fetchone()[0], 1)
+        turns = conn.execute("SELECT vendor_turn_id,status,sequence FROM turns WHERE run_id=?", (run("ses_v2_root"),)).fetchall()
+        self.assertEqual([tuple(row) for row in turns], [("msg_v2_2", "completed", 2)])
+        kinds = [tuple(row) for row in conn.execute(
+            "SELECT kind,item_type,turn_id IS NOT NULL FROM events WHERE run_id=? AND item_type<>'session' ORDER BY sequence,sub_index",
+            (run("ses_v2_root"),),
+        )]
+        self.assertIn(("instruction", "synthetic", 0), kinds)
+        self.assertIn(("attachment", "file", 1), kinds)
+        for expected in ("reasoning", "tool_call", "tool_result"):
+            self.assertIn(expected, {kind for kind, _, linked in kinds if linked})
+        self.assertIn(("status", "session_inbox:synthetic", 0), kinds)
+        self.assertIn(("instruction", "instruction_state", 0), kinds)
+        self.assertIn(("status", "background_job", 0), kinds)
+        usage = conn.execute("SELECT input_tokens,cached_input_tokens,output_tokens,reasoning_tokens,turn_id FROM usage_records WHERE provider='opencode'").fetchall()
+        self.assertEqual([tuple(row)[:4] for row in usage], [(11, 2, 7, 3)])
+        self.assertTrue(usage[0]["turn_id"])
+        files = {row[0]: (row[1], row[2]) for row in conn.execute("SELECT relative_path,run_id,turn_id FROM artifacts")}
+        self.assertEqual(files["tool-output/tool_v2"][0], run("ses_v2_root"))
+        self.assertEqual(files["shell/proj-v2/sh_v2.out"][0], run("ses_v2_root"))
+        self.assertTrue(files["tool-output/tool_v2"][1])
+        self.assertEqual(files["shell/proj-v2/sh_unlinked.out"], (None, None))
+        tables = {row[0] for row in conn.execute("SELECT DISTINCT native_type FROM raw_records")}
+        self.assertFalse(tables & {"credential", "event"})
+        self.assertFalse(conn.execute("SELECT 1 FROM raw_records WHERE logical_key LIKE '%models-dev%'").fetchone())
+        before = conn.execute("SELECT (SELECT COUNT(*) FROM events),(SELECT COUNT(*) FROM turns),(SELECT COUNT(*) FROM usage_records)").fetchone()
+        # A vault normalized by an older reader is rebuilt from its archived rows.
+        conn.execute("UPDATE vault_meta SET value='1' WHERE key='opencode_normalizer'")
+        conn.execute("INSERT INTO turns(id,run_id,vendor_turn_id) VALUES('stale',?,'msg_v2_3')", (run("ses_v2_root"),))
+        conn.commit()
+        VaultSyncer(conn, options).sync()
+        after = conn.execute("SELECT (SELECT COUNT(*) FROM events),(SELECT COUNT(*) FROM turns),(SELECT COUNT(*) FROM usage_records)").fetchone()
+        self.assertEqual(tuple(after), tuple(before))
+        self.assertEqual(verify(conn, self.vault)[0], [])
+
+    def test_openchamber_run_and_project_files_without_secrets(self) -> None:
+        opencode = self._make_opencode_v2()
+        db = sqlite3.connect(opencode / "opencode.db")
+        created = {"type": "tool", "id": "call_create", "name": "openchamber", "state": {
+            "status": "completed", "input": {"action": "session.create", "parameters": {"title": "worker"}},
+            "content": [{"type": "text", "text": json.dumps({"ok": True, "action": "session.create", "data": {"sessionId": "ses_v2_worker"}})}],
+        }}
+        db.execute("INSERT INTO session_v2(id,project_id,slug,directory,title,version,model,time_created,time_updated) VALUES('ses_v2_worker','proj-v2','w',?,'Worker','2.0','{}',1,1)", (str(self.root / "repo"),))
+        db.execute("INSERT INTO session_message VALUES('msg_v2_create','ses_v2_root','assistant',8,8,8,?)", (json.dumps({"content": [created]}),))
+        chat = self.root / "openchamber/chats/2026-10-07/session-abc"
+        db.execute("INSERT INTO session_v2(id,project_id,slug,directory,title,version,model,time_created,time_updated) VALUES('ses_v2_chat','proj-v2','c',?,'Chat','2.0','{}',1,1)", (str(chat),))
+        db.commit()
+        db.close()
+        data = self.root / "openchamber"
+        repo = self.root / "repo"
+        files = {
+            data / "goals/ses_v2_root.md": b"Ship the fixture",
+            data / "dispatch-results.json": b'{"version":1,"entries":[]}',
+            data / "sessions-archive.json": b'{"ses_v2_child":1791000000000,"ses_v2_fork":null}',
+            data / "sessions-directories.json": b'{"version":1,"foldersMap":{}}',
+            data / "projects" / ("path_" + base64.urlsafe_b64encode(str(repo).encode()).decode().rstrip("=") + ".json"): b'{"version":1,"scheduledTasks":[]}',
+            data / "projects/path_x/context.json": b'{"version":2,"notes":[]}',
+            data / "projects/path_x/plans/1-plan.md": b"# Personal plan",
+            data / "guest-storage/agent-canvas.json": b'{"draft":{"notes":"n"}}',
+            chat / "notes.txt": b"chat output",
+            repo / ".openchamber/project.json": b'{"version":1,"plansDir":"docs/plans"}',
+            repo / ".openchamber/screenshots/shot.jpg": b"jpeg",
+            repo / "docs/plans/shared-plan.md": b"# Shared plan",
+            repo / ".agents/loops/nightly.md": b"---\nschedule: daily\n---\nrun it",
+        }
+        secrets = {
+            data / "settings.json": json.dumps({"projects": [{"path": str(repo)}], "desktopUiPassword": "hunter2"}).encode(),
+            data / "jwt-secret": b"secret",
+            data / "environment.json": b'{"TOKEN":"secret"}',
+            data / "projects/path_x.json.lock": b"lock",
+            chat / "node_modules/pkg/index.js": b"vendored",
+            repo / ".openchamber/npm-global/bin/tool": b"binary",
+            repo / "docs/plans/../notes.md": b"outside",
+        }
+        for path, content in {**files, **secrets}.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+        conn = open_database(self.vault)
+        self.addCleanup(conn.close)
+        options = self.options(codex_home=None, claude_home=None, claude_app_support=None, opencode_data=opencode,
+                               openchamber_data=data, scan_project_dirs=True, artifact_max_bytes=1024)
+        self.assertEqual(VaultSyncer(conn, options).sync().warnings, 0)
+        rows = conn.execute("SELECT a.kind,a.run_id,s.root_path,a.relative_path,b.data FROM artifacts a JOIN source_instances s ON s.id=a.source_instance_id LEFT JOIN blobs b ON b.sha256=a.blob_sha256").fetchall()
+        archived = {Path(row["root_path"]) / row["relative_path"]: row for row in rows}
+        for path, content in files.items():
+            self.assertIn(path, archived)
+            self.assertEqual(archived[path]["data"], content)
+        self.assertFalse(set(secrets) & set(archived))
+        self.assertFalse(conn.execute("SELECT 1 FROM blobs WHERE data LIKE '%hunter2%' OR data LIKE '%secret%'").fetchone())
+        run = lambda sid: f"opencode:fixture-host:{sid}:main"
+        self.assertEqual(archived[data / "goals/ses_v2_root.md"]["run_id"], run("ses_v2_root"))
+        self.assertEqual(archived[chat / "notes.txt"]["run_id"], run("ses_v2_chat"))
+        kinds = {path.name: row["kind"] for path, row in archived.items()}
+        self.assertEqual((kinds["shared-plan.md"], kinds["1-plan.md"], kinds["shot.jpg"], kinds["nightly.md"]), ("plan", "plan", "screenshot", "loop"))
+        self.assertEqual(conn.execute("SELECT relation FROM run_edges WHERE child_run_id=?", (run("ses_v2_worker"),)).fetchone()[0], "dispatch")
+        self.assertEqual(conn.execute("SELECT status FROM runs WHERE id=?", (run("ses_v2_child"),)).fetchone()[0], "archived")
+        self.assertEqual(conn.execute("SELECT status FROM runs WHERE id=?", (run("ses_v2_fork"),)).fetchone()[0], "active")
+        # Project folders are only scanned for this machine's own histories.
+        imported = self.root / "imported.sqlite"
+        other = open_database(imported)
+        self.addCleanup(other.close)
+        VaultSyncer(other, self.options(db_path=imported, codex_home=None, claude_home=None, claude_app_support=None,
+                                        opencode_data=None, openchamber_data=data)).sync()
+        self.assertFalse(other.execute("SELECT 1 FROM artifacts WHERE kind IN ('screenshot','loop')").fetchone())
+        self.assertEqual(verify(conn, self.vault)[0], [])
 
     def test_unreadable_task_directory_preserves_sibling_artifacts(self) -> None:
         empty = self.claude / "tasks/session-empty"

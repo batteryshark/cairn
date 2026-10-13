@@ -3,9 +3,9 @@
 # cairn
 
 Keep one archive of every local agent run. `cairn` reads the histories that
-Codex, Claude Code, and OpenCode leave on disk and writes them into a single
-SQLite file you own. That covers every Codex and Claude surface: the desktop
-apps, the CLIs, the IDE extensions, and headless `codex exec`.
+Codex, Claude Code, OpenCode, and OpenChamber leave on disk and writes them into
+a single SQLite file you own. That covers every Codex and Claude surface: the
+desktop apps, the CLIs, the IDE extensions, and headless `codex exec`.
 
 It runs on Python 3.11 or newer and uses only the standard library.
 
@@ -62,6 +62,7 @@ With no flags, `sync` uses whichever of these directories exist:
 | Claude Code | `~/.claude` |
 | Claude Desktop | `~/Library/Application Support/Claude/claude-code-sessions` |
 | OpenCode | `$XDG_DATA_HOME/opencode` or `~/.local/share/opencode` |
+| OpenChamber | `$OPENCHAMBER_DATA_DIR` or `~/.config/openchamber`, plus `$OPENCHAMBER_CHATS_DIR` |
 
 Codex Desktop, the Codex CLI, the VS Code extension, and `codex exec` all write
 to the same `~/.codex` root, so one path covers them. Each run keeps the
@@ -77,12 +78,15 @@ cairn sync ~/vault.sqlite \
   --codex-home /archives/build-mac-01/.codex \
   --claude-home /archives/build-mac-01/.claude \
   --claude-app-support /archives/build-mac-01/claude-code-sessions \
-  --opencode-data /archives/build-mac-01/opencode
+  --opencode-data /archives/build-mac-01/opencode \
+  --openchamber-data /archives/build-mac-01/openchamber
 ```
 
 Explicit paths are pinned. A missing path is an error, and any provider you do
 not name is disabled for that run. That keeps an imported archive from being
-silently attributed to the local machine.
+silently attributed to the local machine. For the same reason, project folders
+are only searched for `.openchamber/` and `.agents/loops/` when syncing this
+machine's own histories.
 
 For a closed Mac backup mounted through an APFS driver on Windows, add
 `--snapshot-source-sqlite` if source databases report `database is locked`.
@@ -150,13 +154,71 @@ memory contents create new artifact versions; native exports recover every
 stored version under its original relative path. The artifact size cap applies
 to memory files and database snapshots too.
 
-OpenCode ingestion covers the SQLite session, message, and part projections,
-parent sessions, text and reasoning parts, tool calls and results, per-response
-tokens and cost, todos, queued inputs, context epochs, workspaces, and
-externalized `tool-output` files. OpenCode's `event` table is excluded on
-purpose: it is a replay journal of repeated snapshots of those same
-projections, 16.8 GiB against 1.65 GiB on the store measured here, and holds no
-run content the projections lack.
+OpenCode ingestion reads both database layouts. For the V1 layout it covers the
+session, message, and part projections. For V2 (`session_v2`, with content
+blocks stored inline in `session_message`) it covers synthetic and system
+messages, compactions, idle outcomes, and agent, model, and location switches.
+A V2 turn runs from one user message to the next.
+
+For both layouts it also covers:
+
+- parent and forked sessions;
+- text and reasoning blocks;
+- tool calls and results;
+- per-response tokens and cost;
+- todos, queued and pending inputs, and context epochs;
+- per-session instruction state and its content-addressed instruction blobs;
+- workspaces and worktrees;
+- background-job records;
+- externalized `tool-output` files and background `shell` output.
+
+Externalized files are linked to the run and turn that produced them when OpenCode
+recorded the link. Shell output from commands that OpenCode never tied to a
+session stays archived under its project folder.
+
+A vault normalized by an older release is rebuilt from its archived rows on the
+next sync.
+
+Some OpenCode data is excluded on purpose:
+
+- The `event` table is a replay journal of repeated snapshots of those same
+  projections, 16.8 GiB against 1.65 GiB on the store measured here. It holds no
+  run content the projections lack.
+- Credentials, accounts, permissions, and the cached model catalog in `kv`.
+- File-snapshot git stores, worktree checkouts, and logs.
+
+OpenChamber runs on OpenCode, so its sessions are the OpenCode runs above; runs
+it drove report `OpenChamber` in `runs.surface`. Sessions OpenChamber creates
+with its `session.create` tool are linked to the session that created them as
+`dispatch` edges.
+
+Its sessions-archive list sets run status. Archived from the OpenChamber data
+directory, all byte-for-byte:
+
+- session goals and the sessions archive;
+- session folders and queued messages;
+- pending dispatch results;
+- per-project scheduled tasks, notes, todos, and personal plans;
+- agent memory;
+- extension state such as canvas drafts;
+- walkthroughs and archived spaces;
+- the working folders of project-less chats, without `.git`, `node_modules`,
+  or virtualenvs.
+
+In each project folder it archives the shared `.openchamber/project.json`, the
+shared plans folder (`.openchamber/plans` or the `plansDir` it names), agent
+screenshots in `.openchamber/screenshots`, and `.agents/loops` task definitions.
+Project folders come from OpenChamber's project list and OpenCode session
+directories. Only those paths are read from `settings.json`.
+
+Never read from OpenChamber's data directory:
+
+- settings and preferences;
+- passwords, tokens, keys, and pairing or push credentials;
+- `environment.json`;
+- caches, logs, and runtime state.
+
+The Electron app's LevelDB stores, which hold unsent drafts, are not read either.
 
 Ordinary consumer Claude chats, auth and configuration, skills, rules, hooks,
 automations, caches, debug logs, shell snapshots, and queues are excluded.
