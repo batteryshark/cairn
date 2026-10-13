@@ -19,7 +19,8 @@ messages, tool calls, exposed reasoning, token usage, plans, tasks, goals, and
 the artifacts each harness writes.
 
 Syncs are incremental. Re-running the same command resumes each source from a
-saved offset.
+saved offset. When a release changes how a source is read, vaults written by an
+older release are rebuilt from their archived records on the next sync.
 
 ## Quickstart
 
@@ -143,6 +144,10 @@ session index, thread and turn state, spawn edges, subagent threads, plans,
 goals, and thread-linked artifacts. Generated memory files under `.codex/memories`
 and consistent standalone snapshots of `memories_*.sqlite` are versioned artifacts.
 SQLite memory snapshots include committed WAL data and all native tables.
+A forked subagent rollout first replays its parent's history. That prefix is
+kept in the child run as context and not counted again, so the child's turns and
+tokens stay its own. Per-response `token_usage_record` entries and realtime voice
+transcripts are kept as events.
 
 Claude ingestion covers project transcripts, nested subagent transcripts and
 metadata, Desktop code-session links, plans, task and team records,
@@ -175,9 +180,6 @@ For both layouts it also covers:
 Externalized files are linked to the run and turn that produced them when OpenCode
 recorded the link. Shell output from commands that OpenCode never tied to a
 session stays archived under its project folder.
-
-A vault normalized by an older release is rebuilt from its archived rows on the
-next sync.
 
 Some OpenCode data is excluded on purpose:
 

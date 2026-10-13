@@ -75,6 +75,8 @@ class JsonlSource:
 class FileState:
     run_id: str | None
     current_turn_id: str | None = None
+    # First ordinal a forked Codex rollout wrote itself; earlier ones replay its parent.
+    history_start: int | None = None
 
 
 class VaultSyncer:
@@ -148,6 +150,7 @@ class VaultSyncer:
             sources = list(self.discover_jsonl())
             artifact_candidates = list(self.discover_artifacts())
             self._space_check(sources, artifact_candidates)
+            self._renormalize_jsonl()
             for source in sources:
                 self.ingest_jsonl(source)
             self.ingest_codex_databases()
@@ -195,19 +198,14 @@ class VaultSyncer:
     def discover_jsonl(self) -> Iterable[JsonlSource]:
         codex = self.options.codex_home
         if codex and codex.is_dir():
-            for base, kind in ((codex / "sessions", "rollout"), (codex / "archived_sessions", "rollout")):
+            for base in (codex / "sessions", codex / "archived_sessions"):
                 if not base.is_dir():
                     continue
                 for path in sorted(self._discover_paths(base, "*.jsonl", recursive=True)):
-                    match = CODEX_RUN_RE.search(path.name)
-                    if not match:
-                        yield JsonlSource("codex", codex, path, "unknown_jsonl", f"file:{path.relative_to(codex)}", None, "unknown")
-                        continue
-                    vendor_id = match.group(1)
-                    yield JsonlSource("codex", codex, path, kind, f"run:{vendor_id}", vendor_id, "main")
+                    yield self._jsonl_source("codex", codex, path)
             index = codex / "session_index.jsonl"
             if index.is_file():
-                yield JsonlSource("codex", codex, index, "session_index", "session_index", None, "index")
+                yield self._jsonl_source("codex", codex, index)
 
         claude = self.options.claude_home
         projects = claude / "projects" if claude else None
@@ -217,16 +215,28 @@ class VaultSyncer:
                 if len(parts) >= 3 and parts[1] in {"memory", "memories"}:
                     # Memory files are project context, not session transcripts.
                     continue
-                if "subagents" in parts and path.name.startswith("agent-"):
-                    parent_id = path.parent.parent.name
-                    agent_id = path.stem.removeprefix("agent-")
-                    yield JsonlSource(
-                        "claude", claude, path, "subagent", f"agent:{parent_id}:{agent_id}",
-                        f"{parent_id}/{agent_id}", f"agent:{agent_id}", parent_id, agent_id,
-                    )
-                else:
-                    vendor_id = path.stem
-                    yield JsonlSource("claude", claude, path, "transcript", f"main:{vendor_id}", vendor_id, "main")
+                yield self._jsonl_source("claude", claude, path)
+
+    @staticmethod
+    def _jsonl_source(provider: str, root: Path, path: Path) -> JsonlSource:
+        """Describe a history file; discovery and re-normalization share it."""
+        if provider == "codex":
+            if path == root / "session_index.jsonl":
+                return JsonlSource("codex", root, path, "session_index", "session_index", None, "index")
+            match = CODEX_RUN_RE.search(path.name)
+            if not match:
+                return JsonlSource("codex", root, path, "unknown_jsonl", f"file:{path.relative_to(root)}", None, "unknown")
+            vendor_id = match.group(1)
+            return JsonlSource("codex", root, path, "rollout", f"run:{vendor_id}", vendor_id, "main")
+        if "subagents" in path.relative_to(root / "projects").parts and path.name.startswith("agent-"):
+            parent_id = path.parent.parent.name
+            agent_id = path.stem.removeprefix("agent-")
+            return JsonlSource(
+                "claude", root, path, "subagent", f"agent:{parent_id}:{agent_id}",
+                f"{parent_id}/{agent_id}", f"agent:{agent_id}", parent_id, agent_id,
+            )
+        vendor_id = path.stem
+        return JsonlSource("claude", root, path, "transcript", f"main:{vendor_id}", vendor_id, "main")
 
     def discover_artifacts(self) -> Iterable[tuple[str, Path, Path, str, str | None, str | None]]:
         codex = self.options.codex_home
@@ -503,18 +513,14 @@ class VaultSyncer:
         if rescanned:
             offset = 0
             line_index = 0
-        run_id = None
-        if source.vendor_run_id:
-            run_id = self.ensure_run(
-                source.provider, source.vendor_run_id, source.stream_key,
-                parent_vendor_id=source.parent_vendor_id,
-                surface="subagent" if source.parent_vendor_id else None,
-            )
+        run_id = self._source_run(source)
         last_turn = self.conn.execute(
             "SELECT turn_id FROM events WHERE run_id=? AND turn_id IS NOT NULL ORDER BY sequence DESC LIMIT 1",
             (run_id,),
         ).fetchone() if run_id else None
         state = FileState(run_id, str(last_turn[0]) if last_turn else None)
+        if source.provider == "codex" and run_id and line_index:
+            state.history_start = self._codex_history_start(run_id)
         new_offset = offset
         new_line = line_index
         with self.conn:
@@ -603,12 +609,126 @@ class VaultSyncer:
             self.warn(file_id, "invalid_json", error or "invalid JSON", index)
             self.conn.execute("UPDATE raw_records SET normalized=1 WHERE id=?", (raw_id,))
             return bool(inserted.rowcount)
+        self._normalize_record(source, raw_id, index, data, state)
+        return bool(inserted.rowcount)
+
+    def _source_run(self, source: JsonlSource) -> str | None:
+        if not source.vendor_run_id:
+            return None
+        return self.ensure_run(
+            source.provider, source.vendor_run_id, source.stream_key,
+            parent_vendor_id=source.parent_vendor_id,
+            surface="subagent" if source.parent_vendor_id else None,
+        )
+
+    def _codex_history_start(self, run_id: str) -> int | None:
+        """Recover a forked rollout's boundary when a sync resumes inside its replayed prefix."""
+        row = self.conn.execute(
+            "SELECT payload_json FROM events WHERE run_id=? AND item_type='session_meta' ORDER BY sequence LIMIT 1",
+            (run_id,),
+        ).fetchone()
+        return _nullable_int(json.loads(row[0]).get("subagent_history_start_ordinal")) if row else None
+
+    def _normalize_record(self, source: JsonlSource, raw_id: int, index: int, data: Any, state: FileState) -> None:
         if source.provider == "codex":
             self._process_codex(source, raw_id, index, data, state)
         else:
             self._process_claude(source, raw_id, index, data, state)
         self.conn.execute("UPDATE raw_records SET run_id=?,normalized=1 WHERE id=?", (state.run_id, raw_id))
-        return bool(inserted.rowcount)
+
+    def _renormalize_jsonl(self) -> None:
+        """Rebuild Codex and Claude streams normalized by an older reader.
+
+        Earlier releases stored newer record types as unknown. They also let the
+        parent metadata replayed at the top of a forked Codex subagent rollout
+        take over the rest of the file, so the child's turns and token snapshots
+        landed in the parent run. Affected streams, and every stream sharing a
+        run with them, are replayed in order from their archived records.
+        """
+        row = self.conn.execute("SELECT value FROM vault_meta WHERE key='jsonl_normalizer'").fetchone()
+        if row and row[0] == JSONL_NORMALIZER:
+            return
+        active = """SELECT r.id,s.source_instance_id,s.logical_key,s.record_index,r.run_id,r.native_type
+                      FROM stream_records s
+                      JOIN raw_records r ON r.id=s.raw_record_id
+                      JOIN source_instances i ON i.id=s.source_instance_id
+                     WHERE i.surface='history' AND i.provider IN ('codex','claude') AND r.parsed=1"""
+        with self.conn:
+            records = self.conn.execute(active).fetchall()
+            streams = {
+                (int(value[0]), str(value[1])) for value in self.conn.execute(
+                    f"SELECT DISTINCT a.source_instance_id,a.logical_key FROM ({active}) a JOIN events e ON e.raw_record_id=a.id WHERE e.kind='unknown'"
+                )
+            }
+            metas: dict[tuple[int, str], int] = {}
+            for record in records:
+                if record["native_type"] == "session_meta":
+                    key = (int(record["source_instance_id"]), str(record["logical_key"]))
+                    metas[key] = metas.get(key, 0) + 1
+            streams |= {key for key, count in metas.items() if count > 1}
+            runs = {str(record["run_id"]) for record in records if record["run_id"] and (record["source_instance_id"], record["logical_key"]) in streams}
+            streams |= {(int(record["source_instance_id"]), str(record["logical_key"])) for record in records if record["run_id"] in runs}
+            by_stream: dict[tuple[int, str], list[sqlite3.Row]] = {}
+            for record in records:
+                key = (int(record["source_instance_id"]), str(record["logical_key"]))
+                if key in streams:
+                    by_stream.setdefault(key, []).append(record)
+            turns: set[str] = set()
+            files = {
+                key: self.conn.execute(
+                    """SELECT f.id,f.relative_path,i.provider,i.root_path FROM source_files f
+                         JOIN source_instances i ON i.id=f.source_instance_id
+                        WHERE f.source_instance_id=? AND f.logical_key=? ORDER BY f.id""",
+                    key,
+                ).fetchall()
+                for key in by_stream
+            }
+            for key in sorted(by_stream, key=lambda value: int(files[value][0]["id"]) if files[value] else 0):
+                if not files[key]:
+                    continue
+                stream = sorted(by_stream[key], key=lambda value: int(value["record_index"]))
+                raw_ids = [int(record["id"]) for record in stream]
+                file_ids = [int(file["id"]) for file in files[key]]
+                # Their warnings are reissued by the replay if they still apply.
+                self.conn.execute(
+                    f"""DELETE FROM ingest_errors WHERE source_file_id IN ({",".join("?" for _ in file_ids)})
+                          AND code IN ('unknown_codex_record','unknown_codex_item','unknown_codex_event',
+                                       'unknown_claude_record','unknown_claude_content')""",
+                    file_ids,
+                )
+                for start in range(0, len(raw_ids), 500):
+                    chunk = raw_ids[start:start + 500]
+                    placeholders = ",".join("?" for _ in chunk)
+                    turns.update(str(value[0]) for value in self.conn.execute(f"SELECT DISTINCT turn_id FROM events WHERE turn_id IS NOT NULL AND raw_record_id IN ({placeholders})", chunk))
+                    self._deactivate_raw_records(chunk)
+                file = files[key][0]
+                root = Path(file["root_path"])
+                source = self._jsonl_source(file["provider"], root, root / file["relative_path"])
+                state = FileState(self._source_run(source))
+                for record in stream:
+                    raw = self.conn.execute("SELECT raw_zlib FROM raw_records WHERE id=?", (record["id"],)).fetchone()
+                    self._normalize_record(source, int(record["id"]), int(record["record_index"]), json.loads(zlib.decompress(raw[0])), state)
+                    if state.run_id:
+                        runs.add(state.run_id)
+            for run_id in sorted(run for run in runs if run.startswith("codex:")):
+                self.conn.execute(
+                    "DELETE FROM ingest_errors WHERE code='codex_usage_reset' AND source_file_id IS NULL AND message LIKE ? ESCAPE '\\'",
+                    (f"cumulative token usage reset in {_like_escape(run_id)} at %",),
+                )
+                self._recompute_codex_usage(run_id)
+            # Turns that only misattributed records created are left empty.
+            used = {
+                str(value[0]) for value in self.conn.execute(
+                    """SELECT turn_id FROM events WHERE turn_id IS NOT NULL
+                       UNION SELECT turn_id FROM usage_records WHERE turn_id IS NOT NULL
+                       UNION SELECT turn_id FROM artifacts WHERE turn_id IS NOT NULL"""
+                )
+            }
+            self.conn.executemany("DELETE FROM turns WHERE id=?", [(turn,) for turn in sorted(turns - used)])
+            self.conn.execute(
+                "INSERT INTO vault_meta(key,value) VALUES('jsonl_normalizer',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (JSONL_NORMALIZER,),
+            )
 
     def _deactivate_raw_records(self, raw_ids: list[int]) -> None:
         if not raw_ids:
@@ -648,9 +768,19 @@ class VaultSyncer:
         payload = data.get("payload") if isinstance(data.get("payload"), dict) else {}
         timestamp = _string(data.get("timestamp"))
         ordinal = _integer(data.get("ordinal"), sequence)
+        if state.history_start is not None and ordinal < state.history_start:
+            # A forked subagent rollout replays its parent's history before its
+            # own; the parent's rollout already holds those turns and usage.
+            self.add_event(raw_id, state.run_id, None, ordinal, 0, timestamp, "context", data, item_type="forked_history")
+            return
         if top_type == "session_meta":
             vendor_id = _string(payload.get("id") or payload.get("session_id") or source.vendor_run_id)
+            if vendor_id and state.run_id and state.run_id != self.run_id("codex", vendor_id, source.stream_key):
+                # Another thread's metadata inside this rollout never takes the rollout over.
+                self.add_event(raw_id, state.run_id, None, ordinal, 0, timestamp, "context", data, item_type="forked_history")
+                return
             if vendor_id:
+                state.history_start = _nullable_int(payload.get("subagent_history_start_ordinal"))
                 source_info = payload.get("source") if isinstance(payload.get("source"), dict) else {}
                 spawn = _nested(source_info, "subagent", "thread_spawn")
                 parent_vendor = _string(spawn.get("parent_thread_id")) if isinstance(spawn, dict) else source.parent_vendor_id
@@ -694,6 +824,24 @@ class VaultSyncer:
         if top_type == "event_msg":
             self._codex_event_message(raw_id, state, ordinal, timestamp, payload)
             return
+        if top_type == "token_usage_record":
+            # Per-response usage; turn totals still come from cumulative snapshots.
+            vendor_turn = _string(payload.get("turn_id"))
+            if state.run_id and vendor_turn:
+                state.current_turn_id = self.ensure_turn(state.run_id, vendor_turn)
+            self.add_event(raw_id, state.run_id, state.current_turn_id, ordinal, 0, timestamp, "usage", payload, item_type="token_usage_record")
+            return
+        if top_type == "realtime_item":
+            item_type = _string(payload.get("type")) or "unknown"
+            if item_type == "transcript_segment":
+                self.add_event(raw_id, state.run_id, state.current_turn_id, ordinal, 0, timestamp, "message", payload, role=_string(payload.get("role")), item_type=item_type, message_id=_string(payload.get("id")))
+                return
+            if item_type in {"realtime_session_started", "realtime_session_closed"}:
+                self.add_event(raw_id, state.run_id, state.current_turn_id, ordinal, 0, timestamp, "status", payload, item_type=item_type)
+                return
+            self.add_event(raw_id, state.run_id, state.current_turn_id, ordinal, 0, timestamp, "unknown", data, item_type=item_type)
+            self.warn_for_raw(raw_id, "unknown_codex_record", f"unknown Codex realtime item {item_type!r}", sequence)
+            return
         self.add_event(raw_id, state.run_id, state.current_turn_id, ordinal, 0, timestamp, "unknown", data, item_type=_string(top_type))
         self.warn_for_raw(raw_id, "unknown_codex_record", f"unknown Codex record type {top_type!r}", sequence)
 
@@ -715,6 +863,9 @@ class VaultSyncer:
             return
         if item_type == "reasoning":
             self.add_event(raw_id, state.run_id, state.current_turn_id, sequence, 0, timestamp, "reasoning", payload, item_type=item_type, message_id=_string(payload.get("id")))
+            return
+        if item_type == "compaction":
+            self.add_event(raw_id, state.run_id, state.current_turn_id, sequence, 0, timestamp, "context", payload, item_type=item_type, message_id=_string(payload.get("id")))
             return
         if item_type == "agent_message":
             self.add_event(raw_id, state.run_id, state.current_turn_id, sequence, 0, timestamp, "message", payload, role="assistant", item_type=item_type, message_id=_string(payload.get("id")))
@@ -839,7 +990,11 @@ class VaultSyncer:
             self.conn.execute("UPDATE runs SET surface='Claude Desktop' WHERE id=?", (state.run_id,))
             self.add_event(raw_id, state.run_id, state.current_turn_id, sequence, 0, timestamp, "context", data, item_type=record_type)
             return
-        if record_type in {"mode", "permission-mode", "frame-link", "pr-link", "file-history-snapshot"}:
+        if record_type == "cost-state":
+            # Running session totals; billable usage is counted per response instead.
+            self.add_event(raw_id, state.run_id, state.current_turn_id, sequence, 0, timestamp, "usage", data, item_type=record_type)
+            return
+        if record_type in {"mode", "permission-mode", "agent-setting", "frame-link", "pr-link", "file-history-snapshot", "file-history-delta"}:
             self.add_event(raw_id, state.run_id, state.current_turn_id, sequence, 0, timestamp, "context", data, item_type=record_type)
             return
         if record_type in {
@@ -1945,6 +2100,8 @@ _TOKEN_COLUMNS = (
 
 # Bump when OpenCode normalization changes; older vaults are rebuilt from archived rows.
 OPENCODE_NORMALIZER = "2"
+# Bump when Codex or Claude history normalization changes; see _renormalize_jsonl.
+JSONL_NORMALIZER = "2"
 
 # (table, key columns, incremental cursor column, row filter). Sessions come
 # first so runs exist before their messages. OpenCode's `event` journal,
