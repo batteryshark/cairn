@@ -407,6 +407,74 @@ class VaultTest(unittest.TestCase):
         self.assertFalse(other.execute("SELECT 1 FROM artifacts WHERE kind IN ('screenshot','loop')").fetchone())
         self.assertEqual(verify(conn, self.vault)[0], [])
 
+    def test_forked_codex_rollout_and_newer_record_types(self) -> None:
+        fork = "019dc005-0000-7000-8000-000000000001"
+        stamp = "2026-01-01T00:03:00Z"
+        write_lines(self.codex / "sessions/2026/01/01" / f"rollout-2026-01-01T00-03-00-{fork}.jsonl", [
+            {"timestamp": stamp, "type": "session_meta", "ordinal": 0, "payload": {
+                "id": fork, "forked_from_id": PARENT, "subagent_history_start_ordinal": 3,
+                "source": {"subagent": {"thread_spawn": {"parent_thread_id": PARENT, "depth": 1, "agent_nickname": "Fork"}}},
+            }},
+            # The parent's metadata and history are replayed before the fork's own records.
+            {"timestamp": stamp, "type": "session_meta", "ordinal": 1, "payload": {"id": PARENT, "cwd": str(self.root / "repo")}},
+            {"timestamp": stamp, "type": "event_msg", "ordinal": 2, "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 19, "output_tokens": 9, "total_tokens": 32}}}},
+            {"timestamp": stamp, "type": "turn_context", "ordinal": 3, "payload": {"turn_id": "fork-turn", "cwd": str(self.root / "repo")}},
+            {"timestamp": stamp, "type": "event_msg", "ordinal": 4, "payload": {"type": "task_started", "turn_id": "fork-turn"}},
+            {"timestamp": stamp, "type": "token_usage_record", "ordinal": 5, "payload": {"thread_id": fork, "turn_id": "fork-turn", "usage": {"input_tokens": 4, "output_tokens": 1}}},
+            {"timestamp": stamp, "type": "event_msg", "ordinal": 6, "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 4, "output_tokens": 1, "total_tokens": 5}}}},
+            {"timestamp": stamp, "type": "realtime_item", "ordinal": 7, "payload": {"type": "realtime_session_started", "id": "rt-1"}},
+            {"timestamp": stamp, "type": "realtime_item", "ordinal": 8, "payload": {"type": "transcript_segment", "id": "seg-1", "role": "user", "text": "hello"}},
+            {"timestamp": stamp, "type": "response_item", "ordinal": 9, "payload": {"type": "compaction", "id": "cmp-1"}},
+            {"timestamp": stamp, "type": "event_msg", "ordinal": 10, "payload": {"type": "task_complete", "turn_id": "fork-turn"}},
+        ])
+        transcript = self.claude / "projects" / "-fixture" / f"{CLAUDE}.jsonl"
+        with transcript.open("ab") as handle:
+            for record_type in ("cost-state", "agent-setting", "file-history-delta"):
+                handle.write(line({"type": record_type, "sessionId": CLAUDE, "timestamp": "2026-01-02T00:00:07Z"}))
+        conn, _ = self.sync()
+        self.addCleanup(conn.close)
+        parent_run, fork_run = (f"codex:fixture-host:{value}:main" for value in (PARENT, fork))
+        self.assertEqual([row[0] for row in conn.execute("SELECT vendor_turn_id FROM turns WHERE run_id=?", (fork_run,))], ["fork-turn"])
+        self.assertFalse(conn.execute("SELECT 1 FROM turns WHERE run_id=? AND vendor_turn_id='fork-turn'", (parent_run,)).fetchone())
+        self.assertEqual(conn.execute("SELECT total_tokens FROM usage_records WHERE run_id=? AND scope='turn'", (fork_run,)).fetchone()[0], 5)
+        replayed = conn.execute("SELECT kind,run_id,turn_id FROM events WHERE item_type='forked_history'").fetchall()
+        self.assertEqual([tuple(row) for row in replayed], [("context", fork_run, None)] * 2)
+        kinds = dict(conn.execute(
+            """SELECT item_type,kind FROM events WHERE item_type IN
+               ('token_usage_record','realtime_session_started','transcript_segment','compaction','cost-state','agent-setting','file-history-delta')"""
+        ))
+        self.assertEqual(kinds, {
+            "token_usage_record": "usage", "realtime_session_started": "status", "transcript_segment": "message",
+            "compaction": "context", "cost-state": "usage", "agent-setting": "context", "file-history-delta": "context",
+        })
+        codes = {row[0] for row in conn.execute("SELECT DISTINCT code FROM ingest_errors")}
+        self.assertNotIn("codex_usage_reset", codes)
+        self.assertNotIn("unknown_claude_record", codes)
+
+        # Recreate what an older reader left behind: unknown records, and the
+        # fork's own turn and events attributed to the parent run.
+        snapshot = lambda: (
+            [tuple(row) for row in conn.execute("SELECT id,run_id,turn_id,kind FROM events ORDER BY id")],
+            sorted(row[0] for row in conn.execute("SELECT id FROM turns")),
+            [tuple(row) for row in conn.execute("SELECT id,run_id,turn_id,total_tokens FROM usage_records ORDER BY id")],
+        )
+        before = snapshot()
+        stale = f"{parent_run}:turn:fork-turn"
+        conn.execute("UPDATE events SET kind='unknown' WHERE item_type='cost-state'")
+        transcript_file = conn.execute("SELECT id FROM source_files WHERE relative_path LIKE ?", (f"%{CLAUDE}.jsonl",)).fetchone()[0]
+        conn.execute("INSERT INTO ingest_errors(source_file_id,severity,code,message,created_at) VALUES(?,'warning','unknown_claude_record','unknown Claude record ''cost-state''','now')", (transcript_file,))
+        conn.execute("INSERT INTO turns(id,run_id,vendor_turn_id) VALUES(?,?,'fork-turn')", (stale, parent_run))
+        conn.execute("UPDATE events SET run_id=?,turn_id=? WHERE run_id=? AND turn_id IS NOT NULL", (parent_run, stale, fork_run))
+        conn.execute("UPDATE raw_records SET run_id=? WHERE id IN (SELECT raw_record_id FROM events WHERE turn_id=?)", (parent_run, stale))
+        conn.execute("INSERT INTO ingest_errors(source_file_id,severity,code,message,created_at) VALUES(NULL,'warning','codex_usage_reset',?,'now')", (f"cumulative token usage reset in {parent_run} at {stale}",))
+        conn.execute("UPDATE vault_meta SET value='1' WHERE key='jsonl_normalizer'")
+        conn.commit()
+        VaultSyncer(conn, self.options()).sync()
+        self.assertEqual(snapshot(), before)
+        codes = {row[0] for row in conn.execute("SELECT DISTINCT code FROM ingest_errors")}
+        self.assertFalse(codes & {"codex_usage_reset", "unknown_claude_record"})
+        self.assertEqual(verify(conn, self.vault)[0], [])
+
     def test_unreadable_task_directory_preserves_sibling_artifacts(self) -> None:
         empty = self.claude / "tasks/session-empty"
         empty.mkdir(parents=True)
