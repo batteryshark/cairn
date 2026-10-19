@@ -740,8 +740,21 @@ class VaultTest(unittest.TestCase):
         conn.close()
 
     def test_git_remote_normalization_strips_credentials(self) -> None:
-        self.assertEqual(normalize_git_remote("git@GitHub.com:Owner/Repo.git"), "github.com/Owner/Repo")
-        self.assertEqual(normalize_git_remote("https://token@example.com/org/repo.git"), "example.com/org/repo")
+        expected = "example.invalid/fixture-team/fixture-repo"
+        cases = [
+            ("https-userinfo", "https://fixture-user:fixture-password@EXAMPLE.invalid/fixture-team/fixture-repo.git?fixture-query=ignored#fixture-fragment", expected),
+            ("ssh-userinfo-port", "ssh://fixture-user:fixture-password@EXAMPLE.invalid:2222/fixture-team/fixture-repo.git", "example.invalid:2222/fixture-team/fixture-repo"),
+            ("scp-userinfo", "fixture-user@EXAMPLE.invalid:fixture-team/fixture-repo.git", expected),
+            ("plain-https", "https://EXAMPLE.invalid/fixture-team/fixture-repo.git", expected),
+            ("whitespace", "  https://EXAMPLE.invalid/fixture-team/fixture-repo.git  ", expected),
+            ("no-dot-git", "https://EXAMPLE.invalid/fixture-team/fixture-repo", expected),
+        ]
+        for label, remote, target in cases:
+            with self.subTest(case=label):
+                normalized = normalize_git_remote(remote)
+                self.assertEqual(normalized, target)
+                for excluded in ("fixture-user", "fixture-password", "fixture-query", "fixture-fragment"):
+                    self.assertNotIn(excluded, normalized)
 
     def test_refuses_unrelated_sqlite_database(self) -> None:
         unrelated = self.root / "unrelated.sqlite"

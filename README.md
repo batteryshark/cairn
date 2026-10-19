@@ -1,28 +1,40 @@
-<img src="docs/cairn.svg" alt="" width="72" align="left" hspace="12">
+<img src="docs/cairn.svg" alt="Cairn stacked-stone logo" width="72" align="left" hspace="12">
 
 # cairn
 
-Keep one archive of every local agent run. `cairn` reads the histories that
-Codex, Claude Code, OpenCode, and OpenChamber leave on disk and writes them into
-a single SQLite file you own. That covers every Codex and Claude surface: the
-desktop apps, the CLIs, the IDE extensions, and headless `codex exec`.
+Cairn keeps a local archive of coding-agent work across Codex, Claude Code,
+OpenCode and OpenChamber. It reads their on-disk histories into one SQLite vault,
+keeping raw records alongside queryable runs, turns, tool calls and token usage.
 
-It runs on Python 3.11 or newer and uses only the standard library.
+Use it when you want to find the work behind a decision, follow a run into its
+subagents, or keep a history after the original session files disappear. You can
+query the vault with SQL and export its records without opening each harness.
 
 <br clear="left">
 
-## What it stores
+## Why keep a separate archive?
 
-Every native JSONL record is kept byte-for-byte and compressed. On top of that,
-`cairn` builds normalized tables you can query: workloads, run trees, turns,
-messages, tool calls, exposed reasoning, token usage, plans, tasks, goals, and
-the artifacts each harness writes.
+Harness memory and project notes hold context you want an agent to use again.
+Cairn preserves the recorded conversation and tool output behind that context,
+along with supported plans, memories and other artifacts. Keeping both lets you
+retain a short project decision and still look up how the agent reached it.
 
-Syncs are incremental. Re-running the same command resumes each source from a
-saved offset. When a release changes how a source is read, vaults written by an
-older release are rebuilt from their archived records on the next sync.
+- Find a past implementation discussion across supported harnesses with a SQL
+  text query, then inspect the matching run's messages and tool results.
+- Review a parent run and its recorded child runs together. Run edges preserve
+  spawn, fork and supported OpenChamber dispatch relationships.
+- Compare recorded token usage by day and provider, with cached input and
+  reasoning categories kept separate. Provider accounting semantics still differ.
+- Keep versioned copies of supported memory files and artifacts, even after they
+  change at the source.
 
-## Quickstart
+Cairn has a CLI, SQL views and exports. It doesn't provide a GUI, semantic search,
+an MCP server or automatic memory injection into a harness. It needs no model,
+API key or backend service; the runtime uses Python's standard library.
+
+## Start from source
+
+You need Python 3.11 or newer with SQLite support. On POSIX systems:
 
 ```sh
 git clone https://github.com/batteryshark/cairn.git
@@ -31,270 +43,95 @@ cd cairn
 ./cairn status ~/vault.sqlite
 ```
 
-To run it from anywhere, symlink the launcher. It finds its own `src`
-directory, so the symlink can live where you like:
+`sync` with no source flags discovers supported histories in your home directory
+and selected project files. **It performs no redaction:** the vault can contain
+private conversations, credentials in tool output, source code and screenshots.
+Choose a private destination with enough free space before syncing.
+
+The first sync archives available supported records. Later syncs resume from
+checkpoints. `status` reports workloads, turns, tool calls, artifacts, warnings
+and usage totals. Review warnings for unreadable files or unknown record types;
+a successful command doesn't establish that every source format was understood.
+
+On Windows, use `cairn.cmd` from the checkout with the same arguments; it requires
+the `py -3` launcher and Python 3.11+. See the [reference](docs/reference.md) for
+source paths, copied histories, optional installation and zipapp packaging.
+
+## Find and recover past work
+
+Open the vault read-only in a SQLite client. For example, with the separately
+installed `sqlite3` shell:
 
 ```sh
-ln -s "$PWD/cairn" ~/.local/bin/cairn
+sqlite3 -readonly ~/vault.sqlite
 ```
-
-There is no PyPI package. Install from a checkout, or use
-`python3 -m pip install -e .` if you prefer an editable install.
-
-## Commands
-
-```sh
-cairn sync   ~/vault.sqlite
-cairn status ~/vault.sqlite [--json]
-cairn verify ~/vault.sqlite [--full]
-cairn export ~/vault.sqlite --format unified-jsonl --output vault.jsonl
-cairn export ~/vault.sqlite --format native --output native-export
-```
-
-Exit codes: `0` clean, `2` finished with warnings, `1` fatal.
-
-## Sources
-
-With no flags, `sync` uses whichever of these directories exist:
-
-| Source | Path |
-| --- | --- |
-| Codex, every surface | `~/.codex` |
-| Claude Code | `~/.claude` |
-| Claude Desktop | `~/Library/Application Support/Claude/claude-code-sessions` |
-| OpenCode | `$XDG_DATA_HOME/opencode` or `~/.local/share/opencode` |
-| OpenChamber | `$OPENCHAMBER_DATA_DIR` or `~/.config/openchamber`, plus `$OPENCHAMBER_CHATS_DIR` |
-
-Codex Desktop, the Codex CLI, the VS Code extension, and `codex exec` all write
-to the same `~/.codex` root, so one path covers them. Each run keeps the
-originator that produced it in `runs.surface`, for example `Codex Desktop`,
-`codex_vscode`, or `codex_exec`. The Codex app's own Electron caches under
-`~/Library/Application Support` hold no run content and are not read.
-
-To import a history copied from another machine, name that machine:
-
-```sh
-cairn sync ~/vault.sqlite \
-  --host-id build-mac-01 \
-  --codex-home /archives/build-mac-01/.codex \
-  --claude-home /archives/build-mac-01/.claude \
-  --claude-app-support /archives/build-mac-01/claude-code-sessions \
-  --opencode-data /archives/build-mac-01/opencode \
-  --openchamber-data /archives/build-mac-01/openchamber
-```
-
-Explicit paths are pinned. A missing path is an error, and any provider you do
-not name is disabled for that run. That keeps an imported archive from being
-silently attributed to the local machine. For the same reason, project folders
-are only searched for `.openchamber/` and `.agents/loops/` when syncing this
-machine's own histories.
-
-For a closed Mac backup mounted through an APFS driver on Windows, add
-`--snapshot-source-sqlite` if source databases report `database is locked`.
-This reads temporary local copies of the source databases and their WAL files,
-leaving the original backup untouched. Copied SHM files are excluded so SQLite
-can rebuild them. Use this option only for backups that are no longer being
-written. Keep the destination vault on a local filesystem that supports SQLite
-locking, and allow temporary space for the largest source database and its WAL.
-
-## Size limits
-
-The first sync checks free disk space. Defaults are 64 MiB per copied artifact
-and 256 MiB per JSONL record:
-
-```sh
-cairn sync ~/vault.sqlite \
-  --artifact-max-bytes 134217728 \
-  --max-record-bytes 536870912
-```
-
-An oversized artifact keeps its metadata and SHA-256 without its bytes. An
-oversized JSONL record stops that one source at the previous checkpoint so you
-can retry with a larger limit. It is never skipped silently.
-
-## Reading the vault
-
-`status` prints archive and usage totals. `verify` runs SQLite `quick_check`,
-foreign-key and run-tree checks, then decompresses and hashes every stored
-record and artifact. `--full` adds SQLite's exhaustive index audit, which can
-take hours on a multi-gigabyte vault.
-
-`export --format unified-jsonl` emits versioned `project`, `workload`, `run`,
-`run_edge`, `turn`, `raw_record`, `event`, `usage`, `artifact`, and
-`ingest_error` envelopes with provider payloads intact and artifact bytes
-base64-encoded.
-
-`export --format native` rebuilds every fully ingested JSONL stream and stored
-artifact under a new empty directory, with a manifest mapping each exported
-file to its original root and path. A live JSONL tail with no trailing newline
-stays out until a later sync sees it.
-
-The database also carries views for direct SQL:
 
 ```sql
-SELECT * FROM workload_summary ORDER BY updated_at DESC;
-SELECT * FROM run_summary WHERE tool_calls > 0;
+-- Find recorded messages mentioning a topic. Substitute your own search text.
+SELECT run_id, timestamp, role, payload_json
+FROM events
+WHERE kind = 'message' AND payload_json LIKE '%database migration%'
+ORDER BY timestamp;
+
+-- Inspect workload totals, including their child runs.
+SELECT title, provider, run_count, tool_calls, total_tokens
+FROM workload_summary ORDER BY updated_at DESC;
+
 SELECT * FROM daily_usage ORDER BY day, provider;
 ```
 
-## Coverage notes
-
-Codex ingestion covers active and archived rollouts from every surface, the
-session index, thread and turn state, spawn edges, subagent threads, plans,
-goals, and thread-linked artifacts. Generated memory files under `.codex/memories`
-and consistent standalone snapshots of `memories_*.sqlite` are versioned artifacts.
-SQLite memory snapshots include committed WAL data and all native tables.
-A forked subagent rollout first replays its parent's history. That prefix is
-kept in the child run as context and not counted again, so the child's turns and
-tokens stay its own. Per-response `token_usage_record` entries and realtime voice
-transcripts are kept as events.
-
-Claude ingestion covers project transcripts, nested subagent transcripts and
-metadata, Desktop code-session links, plans, task and team records,
-externalized tool results, and referenced files in the uploads directory.
-All files under `.claude/projects/<project>/memory` (or `memories`) are preserved
-byte-for-byte as project memory artifacts, including nested files. These are
-shared project context and are not attributed to a single transcript. Changed
-memory contents create new artifact versions; native exports recover every
-stored version under its original relative path. The artifact size cap applies
-to memory files and database snapshots too.
-
-OpenCode ingestion reads both database layouts. For the V1 layout it covers the
-session, message, and part projections. For V2 (`session_v2`, with content
-blocks stored inline in `session_message`) it covers synthetic and system
-messages, compactions, idle outcomes, and agent, model, and location switches.
-A V2 turn runs from one user message to the next.
-
-For both layouts it also covers:
-
-- parent and forked sessions;
-- text and reasoning blocks;
-- tool calls and results;
-- per-response tokens and cost;
-- todos, queued and pending inputs, and context epochs;
-- per-session instruction state and its content-addressed instruction blobs;
-- workspaces and worktrees;
-- background-job records;
-- externalized `tool-output` files and background `shell` output.
-
-Externalized files are linked to the run and turn that produced them when OpenCode
-recorded the link. Shell output from commands that OpenCode never tied to a
-session stays archived under its project folder.
-
-Some OpenCode data is excluded on purpose:
-
-- The `event` table is a replay journal of repeated snapshots of those same
-  projections, 16.8 GiB against 1.65 GiB on the store measured here. It holds no
-  run content the projections lack.
-- Credentials, accounts, permissions, and the cached model catalog in `kv`.
-- File-snapshot git stores, worktree checkouts, and logs.
-
-OpenChamber runs on OpenCode, so its sessions are the OpenCode runs above; runs
-it drove report `OpenChamber` in `runs.surface`. Sessions OpenChamber creates
-with its `session.create` tool are linked to the session that created them as
-`dispatch` edges.
-
-Its sessions-archive list sets run status. Archived from the OpenChamber data
-directory, all byte-for-byte:
-
-- session goals and the sessions archive;
-- session folders and queued messages;
-- pending dispatch results;
-- per-project scheduled tasks, notes, todos, and personal plans;
-- agent memory;
-- extension state such as canvas drafts;
-- walkthroughs and archived spaces;
-- the working folders of project-less chats, without `.git`, `node_modules`,
-  or virtualenvs.
-
-In each project folder it archives the shared `.openchamber/project.json`, the
-shared plans folder (`.openchamber/plans` or the `plansDir` it names), agent
-screenshots in `.openchamber/screenshots`, and `.agents/loops` task definitions.
-Project folders come from OpenChamber's project list and OpenCode session
-directories. Only those paths are read from `settings.json`.
-
-Never read from OpenChamber's data directory:
-
-- settings and preferences;
-- passwords, tokens, keys, and pairing or push credentials;
-- `environment.json`;
-- caches, logs, and runtime state.
-
-The Electron app's LevelDB stores, which hold unsent drafts, are not read either.
-
-Ordinary consumer Claude chats, auth and configuration, skills, rules, hooks,
-automations, caches, debug logs, shell snapshots, and queues are excluded.
-
-Token accounting is deliberate. Claude response usage counts once per request
-even when the same usage object repeats on thinking, tool, and text blocks.
-Codex turn usage is the difference between successive cumulative snapshots; the
-snapshots stay archived but are never summed. Token categories stay separate
-per provider because their billing semantics are not guaranteed to match.
-
-Claude thinking blocks and signatures are kept when the transcript exposes
-them. Codex reasoning summaries, encrypted payloads, and reasoning-token counts
-are kept. Raw chain-of-thought that a provider never exposes cannot be
-recovered.
-
-## Windows and other machines
-
-Build the single-file launcher once:
+Text matching searches the stored JSON payload, so results include its field
+names as well as message text. For a matched run, use its `run_id` to filter
+`events`; `run_edges` relates parent and child IDs. The [reference](docs/reference.md)
+describes the schema and export formats.
 
 ```sh
-python3 build_zipapp.py
+./cairn verify ~/vault.sqlite
+./cairn export ~/vault.sqlite --format unified-jsonl --output vault.jsonl
+./cairn export ~/vault.sqlite --format native --output native-export
 ```
 
-Copy `cairn.pyz` and, if you want the wrapper, `cairn.cmd` to the Windows
-machine. Install Python 3.11 or newer, then:
+Unified JSONL carries versioned records for downstream analysis. Native export
+reconstructs stored JSONL streams and artifact versions under an empty directory,
+with a manifest of original paths. Database projections export as records;
+Cairn doesn't restore a working harness installation or resume a session.
 
-```powershell
-py -3 cairn.pyz sync D:\Vault\vault.sqlite
-py -3 cairn.pyz verify D:\Vault\vault.sqlite
-```
+## Coverage and storage
 
-Windows defaults are `%USERPROFILE%\.codex`, `%USERPROFILE%\.claude`, and
-`%USERPROFILE%\.local\share\opencode`, plus Claude Desktop metadata under
-`%APPDATA%\Claude`. OpenCode uses that XDG-style path on Windows rather than
-`%LOCALAPPDATA%`; run `opencode debug paths` to confirm for your version.
+Cairn reads Codex active/archived rollouts, Claude Code transcripts and subagents,
+OpenCode V1/V2 database projections, and selected OpenChamber session/project
+content. Desktop code-session metadata is supported; ordinary consumer Claude
+chats are excluded. The [coverage reference](docs/reference.md#source-coverage)
+lists artifacts, exclusions and accounting behavior.
 
-Use one writer per vault. To fold several machines into one file, copy the
-closed vault to the next machine's local disk, run `sync` and `verify` there,
-then copy it back. Do not write a live vault from two machines, and do not put
-the writer database on OneDrive, SMB, or another network filesystem. Native
-Windows and WSL have separate homes and separate OpenCode databases, so sync
-them one after the other.
+Complete ingested JSONL records are compressed and retained byte-for-byte.
+Incomplete tails wait for a later sync. Size caps and inaccessible files can
+leave content unstored; exposed reasoning is preserved only as recorded, and
+encrypted payloads aren't decrypted.
 
-## Security
+Use one writer per vault on a local filesystem with SQLite locking. Sync can
+migrate an older vault and rebuild derived tables; back up a closed vault before
+upgrading. Keep the writer database off network shares and cloud-sync folders.
 
-**`cairn` performs no redaction.** Messages and tool results can contain source
-code, credentials, environment values, and personal information. Treat the
-vault as being as sensitive as everything you have ever typed at an agent.
+## Privacy and rights
 
-On POSIX systems the database, its WAL files, and exports are created
-owner-only. Windows does not map that mode to a restrictive NTFS ACL, so keep
-the vault in a user-only directory and use `icacls` if a custom directory
-inherits wider access. Encrypt the disk that holds it.
+Treat the vault and every export as sensitive as the source histories. Source
+databases are opened in SQLite read-only mode; sync writes the destination vault
+and its sidecars. Local project identification can invoke Git metadata commands.
+Default discovery reaches selected project notes, memories and chat workspaces,
+so review the [discovery and security details](docs/reference.md#privacy-and-side-effects)
+before collecting someone else's histories or importing a copied archive.
 
-Source histories are opened read-only and are never modified. Imported history
-is append-only, and stays in the vault after the original source disappears.
+POSIX files are created owner-only. Windows needs a private directory with
+appropriate ACLs. Cairn doesn't encrypt the vault. Credential-file exclusions
+don't remove secrets embedded in messages or artifacts.
 
-## Layout
-
-```
-cairn            POSIX launcher, no install needed
-cairn.cmd        Windows launcher
-build_zipapp.py  builds the single-file cairn.pyz
-src/cairn/       cli.py, ingest.py, db.py, reporting.py
-tests/           unittest suite
-```
+Cairn's source and documentation use the [MIT license](LICENSE). Its existing
+name and stacked-stone logo are retained. Captured content keeps its own rights
+and confidentiality obligations; see [RIGHTS.md](RIGHTS.md).
 
 ## Development
 
-```sh
-PYTHONPATH=src python3 -m unittest discover -s tests -v
-PYTHONPATH=src python3 -m cairn --help
-```
-
-## License
-
-MIT. See [LICENSE](LICENSE).
+The package is version 0.1.0. Source lives in `src/cairn/`; the generated-fixture
+unittest suite is in `tests/`. See [development and packaging](docs/reference.md#development-and-packaging)
+before running tests or distributing a standalone launcher.
