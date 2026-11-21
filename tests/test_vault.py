@@ -5,6 +5,7 @@ import json
 import shutil
 import sqlite3
 import stat
+import subprocess
 import tempfile
 import unittest
 import os
@@ -701,6 +702,55 @@ class VaultTest(unittest.TestCase):
         VaultSyncer(conn, self.options()).sync()
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM raw_records").fetchone()[0], raw_before + 2)
         self.assertGreater(conn.execute("SELECT COUNT(*) FROM events").fetchone()[0], events_before)
+        conn.close()
+
+    def test_codex_zst_rollout_is_the_same_run(self) -> None:
+        if not shutil.which("zstd"):
+            self.skipTest("fixture needs the zstd binary")
+
+        def compress(path: Path) -> Path:
+            subprocess.run(["zstd", "-q", "-k", str(path)], check=True)
+            return path.with_name(path.name + ".zst")
+
+        def count(conn: sqlite3.Connection, table: str) -> int:
+            return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+        conn, _ = self.sync()
+        before = {table: count(conn, table) for table in ("raw_records", "events", "runs")}
+        # Both forms present: the plain file is the only one read.
+        packed = compress(self.parent_rollout)
+        VaultSyncer(conn, self.options()).sync()
+        self.assertFalse(conn.execute("SELECT 1 FROM source_files WHERE relative_path LIKE '%.zst'").fetchone())
+        # Codex removed the plain file: same run, same records, nothing duplicated.
+        self.parent_rollout.unlink()
+        VaultSyncer(conn, self.options()).sync()
+        self.assertEqual({table: count(conn, table) for table in before}, before)
+        self.assertEqual(
+            conn.execute("SELECT state FROM source_files WHERE relative_path=?", (str(packed.relative_to(self.codex)),)).fetchone()[0],
+            "present",
+        )
+        self.assertEqual(VaultSyncer(conn, self.options()).sync().records_added, 0)
+        # A run that only ever existed compressed, without a final newline.
+        only = "019dc006-0000-7000-8000-000000000002"
+        plain = self.codex / "archived_sessions" / f"rollout-2026-01-02T00-00-00-{only}.jsonl"
+        write_lines(plain, [
+            {"timestamp": "2026-01-02T00:00:00Z", "type": "session_meta", "ordinal": 0, "payload": {"id": only, "cwd": str(self.root / "repo")}},
+            {"timestamp": "2026-01-02T00:00:01Z", "type": "turn_context", "ordinal": 1, "payload": {"turn_id": "zst-turn", "model": "gpt-fixture"}},
+        ], partial={"timestamp": "2026-01-02T00:00:02Z", "type": "event_msg", "ordinal": 2, "payload": {"type": "task_started", "turn_id": "zst-turn"}})
+        compress(plain)
+        plain.unlink()
+        broken = plain.with_name(plain.name.replace(only, "019dc006-0000-7000-8000-000000000003") + ".zst")
+        broken.write_bytes(b"not zstd")
+        with patch("cairn.ingest._zstd_open", return_value=None):
+            stats = VaultSyncer(conn, self.options()).sync()
+        self.assertEqual((stats.zst_skipped, count(conn, "runs")), (2, before["runs"]))
+        self.assertTrue(conn.execute("SELECT 1 FROM ingest_errors WHERE code='zstd_unavailable'").fetchone())
+        self.assertEqual(VaultSyncer(conn, self.options()).sync().records_added, 3)
+        self.assertTrue(conn.execute("SELECT 1 FROM ingest_errors WHERE code='zstd_failed'").fetchone())
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM raw_records r JOIN runs ON runs.id=r.run_id WHERE runs.vendor_run_id=?", (only,)).fetchone()[0], 3,
+        )
+        self.assertEqual(VaultSyncer(conn, self.options()).sync().records_added, 0)
         conn.close()
 
     def test_exports_and_verification(self) -> None:

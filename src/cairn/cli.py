@@ -126,6 +126,7 @@ def _sync(args: argparse.Namespace) -> int:
     print(
         f"synced {stats.files_seen} files: {stats.records_added} records, "
         f"{stats.events_added} events, {stats.artifacts_added} artifacts, {stats.warnings} warnings"
+        + (f"; skipped {stats.zst_skipped} .zst files: needs zstd" if stats.zst_skipped else "")
     )
     return 2 if stats.warnings else 0
 

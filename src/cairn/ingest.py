@@ -27,7 +27,7 @@ from .db import json_text, stable_id, utc_now
 DEFAULT_ARTIFACT_MAX = 64 * 1024 * 1024
 DEFAULT_RECORD_MAX = 256 * 1024 * 1024
 PROBE_BYTES = 4096
-CODEX_RUN_RE = re.compile(r"([0-9a-f]{8}-[0-9a-f-]{27})\.jsonl$", re.I)
+CODEX_RUN_RE = re.compile(r"([0-9a-f]{8}-[0-9a-f-]{27})\.jsonl(\.zst)?$", re.I)
 
 
 @dataclass(frozen=True)
@@ -56,6 +56,7 @@ class SyncStats:
     events_added: int = 0
     artifacts_added: int = 0
     warnings: int = 0
+    zst_skipped: int = 0
 
 
 @dataclass(frozen=True)
@@ -203,6 +204,10 @@ class VaultSyncer:
                     continue
                 for path in sorted(self._discover_paths(base, "*.jsonl", recursive=True)):
                     yield self._jsonl_source("codex", codex, path)
+                # Codex compresses finished rollouts in place. While both exist the plain file is the live one.
+                for path in sorted(self._discover_paths(base, "*.jsonl.zst", recursive=True)):
+                    if not path.with_suffix("").exists():
+                        yield self._jsonl_source("codex", codex, path)
             index = codex / "session_index.jsonl"
             if index.is_file():
                 yield self._jsonl_source("codex", codex, index)
@@ -501,12 +506,26 @@ class VaultSyncer:
         self.stats.files_seen += 1
         offset = int(file_row["checkpoint_offset"])
         line_index = int(file_row["checkpoint_line"])
+        zst = source.path.suffix == ".zst"
+        if zst:
+            # A finished file: read whole or not at all. checkpoint_offset holds the compressed size once done.
+            if offset == stat.st_size:
+                return
+            try:
+                handle = _zstd_open(source.path)
+            except Exception as exc:  # truncated or corrupt archive: keep the rest of the sync
+                self.warn(file_id, "zstd_failed", str(exc))
+                return
+            if handle is None:
+                self.stats.zst_skipped += 1
+                self.warn(file_id, "zstd_unavailable", "skipped: needs Python 3.14 compression.zstd or a zstd binary")
+                return
         identity_changed = (
             file_row["device"] is not None and file_row["inode"] is not None
             and (int(file_row["device"]), int(file_row["inode"])) != (stat.st_dev, stat.st_ino)
         )
         same_size_rewrite = stat.st_size == offset and stat.st_mtime_ns != int(file_row["mtime_ns"])
-        rescanned = (
+        rescanned = zst or (
             stat.st_size < offset or identity_changed or same_size_rewrite
             or not self._probe_matches(source.path, offset, file_row["checkpoint_probe_sha256"])
         )
@@ -524,7 +543,7 @@ class VaultSyncer:
         new_offset = offset
         new_line = line_index
         with self.conn:
-            with source.path.open("rb") as handle:
+            with handle if zst else source.path.open("rb") as handle:
                 handle.seek(offset)
                 while True:
                     start = handle.tell()
@@ -534,14 +553,17 @@ class VaultSyncer:
                     if len(raw) > self.options.max_record_bytes:
                         self.warn(file_id, "record_too_large", f"record {new_line} exceeds {self.options.max_record_bytes} bytes", new_line)
                         break
-                    if not raw.endswith(b"\n"):
+                    if not raw.endswith(b"\n") and not zst:
                         break
                     added = self._ingest_raw_record(source, source_id, file_id, state, new_line, start, raw)
                     if added:
                         self.stats.records_added += 1
                     new_offset = handle.tell()
                     new_line += 1
-            probe = self._probe_hash(source.path, new_offset)
+            if zst:
+                new_offset, probe = stat.st_size, None
+            else:
+                probe = self._probe_hash(source.path, new_offset)
             if rescanned:
                 stale = [
                     int(row[0])
@@ -2301,6 +2323,29 @@ def _json_object(value: Any) -> dict[str, Any]:
 def _sqlite_size_mtime(path: Path) -> tuple[int, int]:
     stats = [candidate.stat() for candidate in (path, Path(f"{path}-wal")) if candidate.exists()]
     return sum(value.st_size for value in stats), max(value.st_mtime_ns for value in stats)
+
+
+def _zstd_open(path: Path):
+    """Decompressed bytes of a .zst as a seekable temp file, or None when nothing here can read zstd."""
+    try:
+        from compression import zstd  # Python 3.14+
+    except ImportError:
+        zstd = None
+    binary = None if zstd else shutil.which("zstd")
+    if not zstd and not binary:
+        return None
+    out = tempfile.TemporaryFile()
+    try:
+        with zstd.open(path, "rb") if zstd else path.open("rb") as src:
+            if zstd:
+                shutil.copyfileobj(src, out)
+            else:
+                subprocess.run([binary, "-dc"], stdin=src, stdout=out, stderr=subprocess.DEVNULL, check=True)
+    except BaseException:
+        out.close()
+        raise
+    out.seek(0)
+    return out
 
 
 def _safe_size(path: Path) -> int:
