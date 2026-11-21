@@ -1,4 +1,4 @@
-"""Reads Codex, Claude, and OpenCode histories into the vault."""
+"""Reads Codex, Claude, OpenCode, and Orchestra histories into the vault."""
 
 from __future__ import annotations
 
@@ -40,6 +40,7 @@ class SyncOptions:
     opencode_data: Path | None = None
     openchamber_data: Path | None = None
     openchamber_chats: Path | None = None
+    orchestra_root: Path | None = None
     # Look for `.openchamber/` and `.agents/loops/` in project folders on this
     # machine. Off for imported archives, whose project paths are not local.
     scan_project_dirs: bool = False
@@ -57,6 +58,8 @@ class SyncStats:
     artifacts_added: int = 0
     warnings: int = 0
     zst_skipped: int = 0
+    orchestra_skipped: int = 0
+    orchestra_unmatched: int = 0
 
 
 @dataclass(frozen=True)
@@ -149,6 +152,7 @@ class VaultSyncer:
         status = "ok"
         try:
             sources = list(self.discover_jsonl())
+            sources.extend(self.discover_orchestra())
             artifact_candidates = list(self.discover_artifacts())
             self._space_check(sources, artifact_candidates)
             self._renormalize_jsonl()
@@ -242,6 +246,66 @@ class VaultSyncer:
             )
         vendor_id = path.stem
         return JsonlSource("claude", root, path, "transcript", f"main:{vendor_id}", vendor_id, "main")
+
+    def discover_orchestra(self) -> Iterable[JsonlSource]:
+        root = self.options.orchestra_root
+        if root is None:
+            return
+        database = root / "orchestra.db"
+        with self._readonly_sqlite(database) as src:
+            rows = [dict(row) for row in src.execute("SELECT * FROM runs ORDER BY id")]
+        # Use the recorded origin, not the import directory or resumable harness session.
+        origin = next((str(row["log_path"]).replace("\\", "/").rsplit("/logs/", 1)[0]
+                       for row in rows if row.get("log_path")), str(root.resolve()))
+        namespace = stable_id("orchestra", origin)
+        runs = {}
+        matched = set()
+        for row in rows:
+            backend = row["backend"]
+            if backend not in {"codex", "claude", "opencode"}:
+                self.stats.orchestra_skipped += 1
+                self._orchestra_warning("orchestra_backend", f"{origin} run {row['id']}: unsupported backend {backend!r}")
+                continue
+            vendor = f"orchestra:{namespace}:{row['id']}"
+            run_id = self.ensure_run(backend, vendor, "main", surface="orchestra",
+                                     cwd=origin.removesuffix("/.orchestra"), title=row.get("title"),
+                                     started_at=row.get("started_at"), metadata=row)
+            runs[row["id"]] = run_id
+            self.conn.execute("UPDATE runs SET cwd=?,model=?,status=?,updated_at=? WHERE id=?",
+                              (row.get("workdir"), row.get("model"), row.get("status"), row.get("finished_at") or row.get("started_at"), run_id))
+            recorded = row.get("log_path")
+            name = str(recorded).replace("\\", "/").rsplit("/", 1)[-1] if recorded else f"run-{row['id']}.jsonl"
+            path = root / "logs" / name
+            if path in matched:
+                self.stats.orchestra_skipped += 1
+                self._orchestra_warning("orchestra_duplicate_log", f"{origin} run {row['id']}: log already mapped: {name}")
+                continue
+            matched.add(path)
+            if not path.is_file():
+                self.stats.orchestra_skipped += 1
+                self._orchestra_warning("orchestra_missing_log", f"{origin} run {row['id']}: missing log {name}")
+                continue
+            yield JsonlSource(backend, root, path, f"orchestra_{backend}", f"run:{vendor}", vendor, "main")
+        for row in rows:
+            child = runs.get(row["id"])
+            parent = runs.get(row.get("parent_run"))
+            if child and parent:
+                self.link_runs(parent, child, "spawn")
+            wakeup = runs.get(row.get("child_wakeup_run"))
+            if child and wakeup:
+                self.link_runs(child, wakeup, "handoff")
+        logs = root / "logs"
+        if logs.is_dir():
+            for path in self._discover_paths(logs, "*.jsonl"):
+                if path not in matched:
+                    self.stats.orchestra_unmatched += 1
+                    self._orchestra_warning("orchestra_unmatched_log", f"{origin}: no run record for {path.name}")
+
+    def _orchestra_warning(self, code: str, message: str) -> None:
+        previous = self.stats.warnings
+        self.warn(None, code, message)
+        if self.stats.warnings == previous:
+            self.stats.warnings += 1
 
     def discover_artifacts(self) -> Iterable[tuple[str, Path, Path, str, str | None, str | None]]:
         codex = self.options.codex_home
@@ -485,7 +549,7 @@ class VaultSyncer:
         return turn_id
 
     def ingest_jsonl(self, source: JsonlSource) -> None:
-        source_id = self.source_instance(source.provider, source.root, "history")
+        source_id = self.source_instance(source.provider, source.root, "orchestra" if source.kind.startswith("orchestra_") else "history")
         stat = source.path.stat()
         relative = str(source.path.relative_to(source.root))
         self.conn.execute(
@@ -628,6 +692,10 @@ class VaultSyncer:
         if row["normalized"]:
             return bool(inserted.rowcount)
         if not parsed:
+            if source.kind.startswith("orchestra_"):
+                self.add_event(raw_id, state.run_id, None, index, 0, None, "context", {"text": raw.decode("utf-8", "replace")}, item_type="captured_output")
+                self.conn.execute("UPDATE raw_records SET normalized=1 WHERE id=?", (raw_id,))
+                return bool(inserted.rowcount)
             self.warn(file_id, "invalid_json", error or "invalid JSON", index)
             self.conn.execute("UPDATE raw_records SET normalized=1 WHERE id=?", (raw_id,))
             return bool(inserted.rowcount)
@@ -652,11 +720,33 @@ class VaultSyncer:
         return _nullable_int(json.loads(row[0]).get("subagent_history_start_ordinal")) if row else None
 
     def _normalize_record(self, source: JsonlSource, raw_id: int, index: int, data: Any, state: FileState) -> None:
-        if source.provider == "codex":
+        if source.kind.startswith("orchestra_"):
+            self._process_orchestra(source, raw_id, index, data, state)
+        elif source.provider == "codex":
             self._process_codex(source, raw_id, index, data, state)
         else:
             self._process_claude(source, raw_id, index, data, state)
         self.conn.execute("UPDATE raw_records SET run_id=?,normalized=1 WHERE id=?", (state.run_id, raw_id))
+
+    def _process_orchestra(self, source: JsonlSource, raw_id: int, sequence: int, data: Any, state: FileState) -> None:
+        if not isinstance(data, dict):
+            self.add_event(raw_id, state.run_id, None, sequence, 0, None, "unknown", data)
+            return
+        kind = data.get("type", "unknown")
+        timestamp = _time_value(data.get("timestamp"))
+        if source.provider == "claude" and kind in {"assistant", "user"}:
+            message = data.get("message") or {}
+            self._claude_content(raw_id, state, sequence, timestamp, message.get("content"), message.get("role") or kind, False, message.get("id"))
+            return
+        if source.provider == "opencode":
+            part = data.get("part")
+            if isinstance(part, dict):
+                self._process_opencode_part(raw_id, {"session_id": source.vendor_run_id, "message_id": part.get("messageID", ""), "time_created": data.get("timestamp"), "data": json_text(part)})
+                return
+        payload = data.get("item") if isinstance(data.get("item"), dict) else data
+        item_type = payload.get("type", kind)
+        event_kind = {"agent_message": "message", "reasoning": "reasoning", "command_execution": "tool_result" if kind == "item.completed" else "tool_call", "mcp_tool_call": "tool_result" if kind == "item.completed" else "tool_call", "orchestra.delivery": "message"}.get(item_type, "status")
+        self.add_event(raw_id, state.run_id, None, sequence, 0, timestamp, event_kind, payload, item_type=item_type, role="assistant" if item_type == "agent_message" else None)
 
     def _renormalize_jsonl(self) -> None:
         """Rebuild Codex and Claude streams normalized by an older reader.

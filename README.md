@@ -101,7 +101,7 @@ Cairn doesn't restore a working harness installation or resume a session.
 Cairn reads Codex active/archived rollouts (plain, and `.jsonl.zst` with Python 3.14
 or a `zstd` binary on PATH), Claude Code transcripts and subagents,
 OpenCode V1/V2 database projections, and selected OpenChamber session/project
-content. Desktop code-session metadata is supported; ordinary consumer Claude
+content, and Orchestra run logs (`--orchestra-root`). Desktop code-session metadata is supported; ordinary consumer Claude
 chats are excluded. The [coverage reference](docs/reference.md#source-coverage)
 lists artifacts, exclusions and accounting behavior.
 

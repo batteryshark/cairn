@@ -16,7 +16,7 @@ from .reporting import export_native, export_unified, print_status, status_data,
 
 
 def parser() -> argparse.ArgumentParser:
-    result = argparse.ArgumentParser(prog="cairn", description="Archive Claude Code, Codex, OpenCode, and OpenChamber runs in one SQLite vault")
+    result = argparse.ArgumentParser(prog="cairn", description="Archive Claude Code, Codex, OpenCode, OpenChamber, and Orchestra runs in one SQLite vault")
     sub = result.add_subparsers(dest="command", required=True)
 
     sync = sub.add_parser("sync", help="incrementally ingest local or copied histories")
@@ -27,6 +27,7 @@ def parser() -> argparse.ArgumentParser:
     sync.add_argument("--claude-app-support", type=Path, help="path to Claude/claude-code-sessions")
     sync.add_argument("--opencode-data", type=Path, help="path to an OpenCode data directory")
     sync.add_argument("--openchamber-data", type=Path, help="path to an OpenChamber data directory (.config/openchamber)")
+    sync.add_argument("--orchestra-root", type=Path, help="path to a project's .orchestra directory")
     sync.add_argument("--artifact-max-bytes", type=_positive_int, default=DEFAULT_ARTIFACT_MAX)
     sync.add_argument("--max-record-bytes", type=_positive_int, default=DEFAULT_RECORD_MAX)
     sync.add_argument("--ignore-space-check", action="store_true")
@@ -92,10 +93,11 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _sync(args: argparse.Namespace) -> int:
-    explicit = any((args.codex_home, args.claude_home, args.claude_app_support, args.opencode_data, args.openchamber_data))
+    explicit = any((args.codex_home, args.claude_home, args.claude_app_support, args.opencode_data, args.openchamber_data, args.orchestra_root))
     if explicit and not args.host_id:
         raise ValueError("--host-id is required when importing explicit source roots")
     home = Path.home()
+    orchestra = _pinned_directory(args.orchestra_root, "--orchestra-root")
     if explicit:
         codex = _pinned_directory(args.codex_home, "--codex-home")
         claude = _pinned_directory(args.claude_home, "--claude-home")
@@ -110,12 +112,13 @@ def _sync(args: argparse.Namespace) -> int:
         opencode = _auto_opencode_data(home)
         openchamber = _auto_openchamber_data(home)
         chats = _auto_openchamber_chats()
-    if not any((codex, claude, app, opencode, openchamber)):
-        raise RuntimeError("no Codex, Claude, OpenCode, or OpenChamber history roots were found")
+    if not any((codex, claude, app, opencode, openchamber, orchestra)):
+        raise RuntimeError("no Codex, Claude, OpenCode, OpenChamber, or Orchestra history roots were found")
     options = SyncOptions(
         db_path=args.vault.expanduser().resolve(), host_id=args.host_id or socket.gethostname(),
         codex_home=codex, claude_home=claude, claude_app_support=app, opencode_data=opencode,
         openchamber_data=openchamber, openchamber_chats=chats, scan_project_dirs=not explicit,
+        orchestra_root=orchestra,
         artifact_max_bytes=args.artifact_max_bytes, max_record_bytes=args.max_record_bytes,
         ignore_space_check=args.ignore_space_check,
         snapshot_source_sqlite=args.snapshot_source_sqlite,
@@ -128,6 +131,8 @@ def _sync(args: argparse.Namespace) -> int:
         f"{stats.events_added} events, {stats.artifacts_added} artifacts, {stats.warnings} warnings"
         + (f"; skipped {stats.zst_skipped} .zst files: needs zstd" if stats.zst_skipped else "")
     )
+    if orchestra:
+        print(f"orchestra: {stats.orchestra_skipped} skipped logs/runs, {stats.orchestra_unmatched} unmatched logs")
     return 2 if stats.warnings else 0
 
 

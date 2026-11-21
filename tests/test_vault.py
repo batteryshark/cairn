@@ -9,6 +9,8 @@ import subprocess
 import tempfile
 import unittest
 import os
+import zlib
+from contextlib import closing
 from unittest.mock import patch
 from pathlib import Path
 
@@ -37,6 +39,94 @@ def write_lines(path: Path, values: list[object], *, partial: object | None = No
         data += json.dumps(partial, separators=(",", ":")).encode()
     path.write_bytes(data)
     return data
+
+
+class OrchestraTest(unittest.TestCase):
+    def test_captured_streams(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            orchestra = root / "copied/.orchestra"
+            logs = orchestra / "logs"
+            logs.mkdir(parents=True)
+            with closing(sqlite3.connect(orchestra / "orchestra.db")) as src:
+                src.execute("""CREATE TABLE runs (
+                    id INTEGER PRIMARY KEY, agent TEXT NOT NULL, backend TEXT NOT NULL,
+                    model TEXT, title TEXT, work_item TEXT, team TEXT, requested_by TEXT NOT NULL,
+                    brief_path TEXT, log_path TEXT, workdir TEXT NOT NULL, branch TEXT,
+                    parent_run INTEGER, lead_run INTEGER, spawn_request_id INTEGER,
+                    child_depth INTEGER NOT NULL DEFAULT 0, child_wakeup_run INTEGER,
+                    child_wakeup_message INTEGER, allow_question INTEGER NOT NULL DEFAULT 0,
+                    question_wait_seconds INTEGER NOT NULL DEFAULT 1800,
+                    supervisor_protocol INTEGER NOT NULL DEFAULT 0, containment_mode TEXT,
+                    workspace_limit_bytes INTEGER, verification_required INTEGER NOT NULL DEFAULT 0,
+                    verification_status TEXT NOT NULL DEFAULT 'not_required', environment_blocker TEXT,
+                    required_capabilities_json TEXT NOT NULL DEFAULT '[]', writes_tree INTEGER NOT NULL DEFAULT 1,
+                    base_commit TEXT, checkpoint_commit TEXT, pid INTEGER, supervisor_pid INTEGER,
+                    session_ref TEXT, status TEXT NOT NULL DEFAULT 'spawning', exit_code INTEGER,
+                    summary TEXT, started_at TEXT NOT NULL, finished_at TEXT, slug TEXT)""")
+                for number, backend in enumerate(("codex", "opencode", "claude", "codex"), 1):
+                    src.execute("""INSERT INTO runs(id,agent,backend,model,title,requested_by,log_path,
+                                   workdir,parent_run,session_ref,status,started_at,finished_at)
+                                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                (number, "invented-worker", backend, "invented-model", f"Invented run {number}",
+                                 "invented-lead", f"/invented/project/.orchestra/logs/run-{number}.jsonl",
+                                 f"/invented/project/.orchestra/worktrees/run-{number}", 1 if number == 2 else None,
+                                 "shared-session" if backend == "codex" else "invented-session",
+                                 "done", "2026-01-01T00:00:00Z", "2026-01-01T00:01:00Z"))
+                src.execute("UPDATE runs SET child_wakeup_run=3 WHERE id=2")
+                src.commit()
+            native = {
+                "run-1.jsonl": b"codex exec --json <prompt>\n" + b"".join(map(line, [
+                    {"type": "thread.started", "thread_id": "shared-session"},
+                    {"type": "item.completed", "item": {"id": "item-1", "type": "agent_message", "text": "invented codex reply"}},
+                    {"type": "turn.completed", "usage": {"input_tokens": 2, "output_tokens": 3}},
+                ])),
+                "run-2.jsonl": b"opencode run --format json <prompt>\n" + line({
+                    "type": "text", "timestamp": 1767225600000, "sessionID": "invented-session",
+                    "part": {"id": "part-1", "messageID": "msg-1", "sessionID": "invented-session",
+                             "type": "text", "text": "invented opencode reply", "time": {"start": 1767225600000}},
+                }),
+                "run-3.jsonl": b"claude -p <prompt> --output-format stream-json --verbose ...\n" + b"".join(map(line, [
+                    {"type": "system", "subtype": "hook_started", "session_id": "invented-session", "uuid": "hook-1"},
+                    {"type": "assistant", "session_id": "invented-session", "uuid": "reply-1",
+                     "message": {"id": "msg-2", "role": "assistant", "content": [{"type": "text", "text": "invented claude reply"}]}},
+                ])),
+                "run-4.jsonl": b"codex exec --json <prompt>\n" + line({"type": "thread.started", "thread_id": "shared-session"}),
+            }
+            for name, raw in native.items():
+                (logs / name).write_bytes(raw)
+            (logs / "run-999.jsonl").write_bytes(line({"type": "thread.started", "thread_id": "unmatched"}))
+            vault = root / "vault.sqlite"
+            options = SyncOptions(db_path=vault, host_id="invented-host", orchestra_root=orchestra, ignore_space_check=True)
+            with closing(open_database(vault)) as conn:
+                stats = VaultSyncer(conn, options).sync()
+                self.assertEqual((stats.orchestra_skipped, stats.orchestra_unmatched, stats.warnings), (0, 1, 1))
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 4)
+                runs = {json.loads(row["metadata_json"])["id"]: row for row in conn.execute("SELECT * FROM runs")}
+                self.assertNotEqual(runs[1]["id"], runs[4]["id"])
+                self.assertEqual(runs[1]["model"], "invented-model")
+                self.assertEqual(runs[1]["updated_at"], "2026-01-01T00:01:00Z")
+                self.assertEqual(runs[2]["cwd"], "/invented/project/.orchestra/worktrees/run-2")
+                self.assertEqual(runs[1]["project_id"], runs[2]["project_id"])
+                edges = {tuple(row) for row in conn.execute("SELECT parent_run_id,child_run_id,relation FROM run_edges")}
+                self.assertEqual(edges, {(runs[1]["id"], runs[2]["id"], "spawn"), (runs[2]["id"], runs[3]["id"], "handoff")})
+                for name, raw in native.items():
+                    records = conn.execute("""SELECT r.raw_zlib,r.run_id FROM raw_records r
+                                              JOIN source_files f ON f.id=r.source_file_id
+                                              WHERE f.relative_path=? ORDER BY r.record_index""", (f"logs/{name}",)).fetchall()
+                    self.assertEqual(b"".join(zlib.decompress(row[0]) for row in records), raw)
+                    self.assertEqual({row[1] for row in records}, {runs[int(name[4:-6])]["id"]})
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM events WHERE kind='message'").fetchone()[0], 3)
+                again = VaultSyncer(conn, options).sync()
+                self.assertEqual((again.records_added, again.events_added, again.orchestra_unmatched, again.warnings), (0, 0, 1, 1))
+                # A failed run's log is only the command and its error text: still archived.
+                (logs / "run-4.jsonl").write_bytes(b"codex exec --json <prompt>\ninvented startup error\n")
+                failed = VaultSyncer(conn, options).sync()
+                self.assertEqual((failed.orchestra_skipped, failed.events_added), (0, 1))
+                (logs / "run-4.jsonl").unlink()
+                missing = VaultSyncer(conn, options).sync()
+                self.assertEqual((missing.orchestra_skipped, missing.orchestra_unmatched), (1, 1))
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0], 4)
 
 
 class VaultTest(unittest.TestCase):

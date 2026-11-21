@@ -64,6 +64,14 @@ host ID for automatic discovery is the machine hostname. Explicit selection
 doesn't sandbox the reader: recorded working directories can still be examined
 for local Git identity, and selected roots can contain sensitive content.
 
+`--orchestra-root` takes one project's `.orchestra` directory: run it once per
+project with the same host ID. Each row of `orchestra.db` `runs` becomes a run
+under its backend (Codex, Claude or OpenCode) with `surface` `orchestra`, and
+its captured CLI stream in `logs/` is kept line for line, including the command
+preamble and plain error text. Runs keep their identity when the copy moves,
+because it comes from the log path recorded in the database. Other tables,
+briefs and worktrees aren't read, and captured usage isn't added to token totals.
+
 For a closed backup whose SQLite files report `database is locked` (for example,
 an APFS backup mounted on Windows), `--snapshot-source-sqlite` reads temporary
 local copies of source databases and their WAL/journal files. Copied SHM files
